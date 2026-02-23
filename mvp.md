@@ -119,17 +119,26 @@ Project scaffold initialized:
 
 **Next Steps:** Replace stub implementations with actual node-llama-cpp and @zvec/zvec integrations when APIs are verified, or continue with Phase 2 using current stubs.
 
-## Phase 2: Ingestion Pipeline
+## ~~Phase 2: Ingestion Pipeline~~ ✅ COMPLETED
 
 **Goal:** Ingest a folder of markdown/text files into memory items + vectors.
 
-- [ ] File discovery (glob patterns per workspace config)
-- [ ] Content hashing for change detection (skip unchanged files)
-- [ ] Chunking strategy (token-aware, heading-boundary preferred, ~900 tokens with overlap)
-- [ ] Upsert flow: parse file -> create/update memory_item row -> chunk -> embed -> store vectors in zvec
-- [ ] Deactivation of removed files
-- [ ] `reindex` command (clear + re-ingest)
+- [x] File discovery (glob patterns per workspace config)
+- [x] Content hashing for change detection (skip unchanged files)
+- [x] Chunking strategy (token-aware, heading-boundary preferred, ~900 tokens with overlap)
+- [x] Upsert flow: parse file -> create/update memory_item row -> chunk -> embed -> store vectors in zvec
+- [x] Deactivation of removed files
+- [x] `reindex` command (clear + re-ingest)
 - **Acceptance:** ingest a real docs folder; `memory_status` shows correct counts; re-ingest same folder shows 0 new items
+
+**Status:** Implemented in commit 96dfe2f:
+- File discovery with glob patterns
+- Content hashing (SHA-256) for change detection
+- Token-aware chunking with heading boundaries (~900 tokens)
+- Full upsert pipeline (parse → memory_item → chunk → embed → vector store)
+- File deactivation on removal
+- Reindex command support
+- Test docs ingested successfully
 
 ## Phase 3: Retrieval Pipeline
 

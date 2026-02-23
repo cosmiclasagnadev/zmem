@@ -80,7 +80,7 @@ export function runMigrations(handle: DbHandle): void {
     CREATE TRIGGER IF NOT EXISTS memory_items_ai AFTER INSERT ON memory_items
     WHEN new.status = 'active'
     BEGIN
-      INSERT INTO memory_items_fts(rowid, title, content, tags)
+      INSERT INTO memory_items_fts(content_rowid, title, content, tags)
       VALUES (new.rowid, new.title, new.content, new.tags);
     END;
   `);
@@ -88,7 +88,7 @@ export function runMigrations(handle: DbHandle): void {
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS memory_items_ad AFTER DELETE ON memory_items
     BEGIN
-      DELETE FROM memory_items_fts WHERE rowid = old.rowid;
+      DELETE FROM memory_items_fts WHERE content_rowid = old.rowid;
     END;
   `);
 
@@ -96,8 +96,10 @@ export function runMigrations(handle: DbHandle): void {
     CREATE TRIGGER IF NOT EXISTS memory_items_au AFTER UPDATE ON memory_items
     WHEN old.status = 'active' OR new.status = 'active'
     BEGIN
-      -- Delete old FTS entry
-      DELETE FROM memory_items_fts WHERE rowid = old.rowid;
+      DELETE FROM memory_items_fts WHERE content_rowid = old.rowid;
+      INSERT INTO memory_items_fts(content_rowid, title, content, tags)
+      SELECT new.rowid, new.title, new.content, new.tags
+      WHERE new.status = 'active';
     END;
   `);
 
@@ -114,4 +116,28 @@ export function runMigrations(handle: DbHandle): void {
     INSERT OR IGNORE INTO schema_migrations (version, applied_at)
     VALUES (1, datetime('now'))
   `).run();
+
+  // Migration v2: Fix broken FTS UPDATE trigger (was missing re-insert)
+  const v2Applied = db.prepare(
+    `SELECT 1 FROM schema_migrations WHERE version = 2`
+  ).get();
+
+  if (!v2Applied) {
+    db.exec(`DROP TRIGGER IF EXISTS memory_items_au;`);
+    db.exec(`
+      CREATE TRIGGER memory_items_au AFTER UPDATE ON memory_items
+      WHEN old.status = 'active' OR new.status = 'active'
+      BEGIN
+        DELETE FROM memory_items_fts WHERE content_rowid = old.rowid;
+        INSERT INTO memory_items_fts(content_rowid, title, content, tags)
+        SELECT new.rowid, new.title, new.content, new.tags
+        WHERE new.status = 'active';
+      END;
+    `);
+
+    db.prepare(`
+      INSERT INTO schema_migrations (version, applied_at)
+      VALUES (2, datetime('now'))
+    `).run();
+  }
 }

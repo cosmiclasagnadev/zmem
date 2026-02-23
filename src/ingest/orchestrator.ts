@@ -190,9 +190,10 @@ export async function ingestWorkspace(
         });
 
         // Collect all chunks for batch embedding
+        // Use doc.id (which is available from parsing) for chunk IDs
         const allChunks = chunkedDocs.flatMap(({ doc, chunks }) =>
           chunks.map((chunk) => ({
-            id: `${doc.contentHash}_${chunk.seq}`,
+            id: `${doc.id}_${chunk.seq}`, // Use doc.id for consistent IDs
             text: chunk.text,
             doc,
             chunk,
@@ -229,15 +230,20 @@ export async function ingestWorkspace(
 
             // Store vectors in zvec
             for (const chunk of chunks) {
-              const chunkId = `${memoryId}_${chunk.seq}`;
+              const chunkId = `${doc.id}_${chunk.seq}`; // Use doc.id for consistent IDs
               const embedding = embeddings.find((e) => e.id === chunkId);
               if (embedding) {
-                vectorStore.insert(chunkId, embedding.embedding);
+                vectorStore.insert(chunkId, embedding.embedding, {
+                  workspace,
+                  scope: "workspace",
+                  type: doc.frontmatter.type || "fact",
+                  status: "active",
+                });
               }
             }
 
             // Mark chunks as embedded
-            const chunkIds = chunks.map((c) => `${memoryId}_${c.seq}`);
+            const chunkIds = chunks.map((c) => `${doc.id}_${c.seq}`);
             markChunksEmbedded(db, chunkIds, embedProvider.model);
 
             result.chunksCreated += chunks.length;

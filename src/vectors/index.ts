@@ -1,79 +1,203 @@
-import type { EmbeddingConfig } from "../config/schema.js";
-
-export interface VectorCollection {
-  insert(id: string, embedding: number[]): void;
-  query(embedding: number[], topK: number): Promise<VectorHit[]>;
-  delete(id: string): void;
-  close(): void;
-}
+import { mkdirSync, existsSync } from "node:fs";
+import { info, debug } from "../utils/logger.js";
 
 export interface VectorHit {
   id: string;
   distance: number;
   score: number;
+  fields: Record<string, unknown>;
+}
+
+export interface VectorCollection {
+  insert(id: string, embedding: number[], metadata?: Record<string, unknown>): void;
+  query(embedding: number[], topK: number, filter?: string): VectorHit[];
+  delete(id: string): void;
+  close(): void;
 }
 
 export interface VectorStore {
   createCollection(name: string, dimensions: number): VectorCollection;
+  openCollection(name: string): VectorCollection | null;
   close(): void;
 }
 
-/**
- * Initialize vector store using @zvec/zvec
- * 
- * TODO: This is a stub implementation. Replace with actual zvec API
- * once we verify the correct import and method signatures.
- */
-export async function initializeVectorStore(config: { zvecPath: string }): Promise<VectorStore> {
-  console.log(`[VectorStore] Initializing at: ${config.zvecPath}`);
-  
-  // TODO: Implement actual zvec initialization
-  // const zvec = await import("@zvec/zvec");
-  // const store = await zvec.open(config.zvecPath);
-  
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let zvec: any = null;
+
+async function ensureZvec(): Promise<any> {
+  if (!zvec) {
+    const mod = await import("@zvec/zvec");
+    zvec = mod.default || mod;
+    const isDev = process.env.ZMEM_ENV === "development" || process.env.NODE_ENV === "development";
+    const verbose = isDev || process.argv.includes("--logs=true");
+    zvec.ZVecInitialize({
+      logType: "console",
+      logLevel: verbose ? 1 : 3, // 1=INFO, 2=WARN, 3=ERROR only
+    });
+  }
+  return zvec;
+}
+
+export async function initializeVectorStore(config: {
+  zvecPath: string;
+}): Promise<VectorStore> {
+  const z = await ensureZvec();
+
+  const basePath = config.zvecPath;
+  if (!existsSync(basePath)) {
+    mkdirSync(basePath, { recursive: true });
+  }
+
+  info(() => `[VectorStore] Initialized at: ${basePath}`);
+
   return {
     createCollection(name: string, dimensions: number): VectorCollection {
-      console.log(`[VectorStore] Creating collection "${name}" with ${dimensions} dimensions`);
-      
-      const vectors = new Map<string, number[]>();
-      
-      return {
-        insert(id: string, embedding: number[]): void {
-          vectors.set(id, embedding);
-        },
+      const collectionPath = `${basePath}/${name}`;
+      debug(
+        () => `[VectorStore] Creating collection "${name}" with ${dimensions} dimensions`
+      );
 
-        async query(embedding: number[], topK: number): Promise<VectorHit[]> {
-          // Brute-force cosine similarity (for testing)
-          const results: VectorHit[] = [];
-          
-          for (const [id, vec] of vectors.entries()) {
-            const dot = vec.reduce((sum, val, i) => sum + val * embedding[i], 0);
-            const magA = Math.sqrt(vec.reduce((sum, val) => sum + val * val, 0));
-            const magB = Math.sqrt(embedding.reduce((sum, val) => sum + val * val, 0));
-            const similarity = dot / (magA * magB);
-            const distance = 1 - similarity;
-            
-            results.push({ id, distance, score: similarity });
-          }
-          
-          // Sort by score descending, take topK
-          return results
-            .sort((a, b) => b.score - a.score)
-            .slice(0, topK);
+      const vectorField = {
+        name: "embedding",
+        dataType: z.ZVecDataType.VECTOR_FP32,
+        dimension: dimensions,
+        indexParams: {
+          indexType: z.ZVecIndexType.HNSW,
+          metricType: z.ZVecMetricType.COSINE,
+          m: 16,
+          efConstruction: 128,
         },
-
-        delete(id: string): void {
-          vectors.delete(id);
-        },
-
-        close(): void {
-          vectors.clear();
-        }
       };
+
+      const fields = [
+        {
+          name: "memory_id",
+          dataType: z.ZVecDataType.STRING,
+        },
+        {
+          name: "workspace",
+          dataType: z.ZVecDataType.STRING,
+          indexParams: {
+            indexType: z.ZVecIndexType.INVERT,
+          },
+        },
+        {
+          name: "scope",
+          dataType: z.ZVecDataType.STRING,
+          indexParams: {
+            indexType: z.ZVecIndexType.INVERT,
+          },
+        },
+        {
+          name: "type",
+          dataType: z.ZVecDataType.STRING,
+          indexParams: {
+            indexType: z.ZVecIndexType.INVERT,
+          },
+        },
+        {
+          name: "status",
+          dataType: z.ZVecDataType.STRING,
+          indexParams: {
+            indexType: z.ZVecIndexType.INVERT,
+          },
+        },
+      ];
+
+      const schema = new z.ZVecCollectionSchema({
+        name,
+        vectors: vectorField,
+        fields,
+      });
+
+      let collection: ReturnType<typeof z.ZVecOpen>;
+      try {
+        collection = z.ZVecOpen(collectionPath);
+        debug(() => `[VectorStore] Opened existing collection "${name}"`);
+      } catch {
+        collection = z.ZVecCreateAndOpen(collectionPath, schema);
+        debug(() => `[VectorStore] Created new collection "${name}"`);
+      }
+
+      return createVectorCollectionWrapper(z, collection);
+    },
+
+    openCollection(name: string): VectorCollection | null {
+      const collectionPath = `${basePath}/${name}`;
+      try {
+        const collection = z.ZVecOpen(collectionPath);
+        return createVectorCollectionWrapper(z, collection);
+      } catch {
+        return null;
+      }
     },
 
     close(): void {
-      console.log("[VectorStore] Closed");
-    }
+      debug(() => "[VectorStore] Closed");
+    },
+  };
+}
+
+function createVectorCollectionWrapper(
+  z: typeof import("@zvec/zvec"),
+  collection: ReturnType<typeof import("@zvec/zvec")["ZVecOpen"]>
+): VectorCollection {
+  return {
+    insert(
+      id: string,
+      embedding: number[],
+      metadata?: Record<string, unknown>
+    ): void {
+      const doc = {
+        id,
+        vectors: {
+          embedding: embedding,
+        },
+        fields: {
+          memory_id: id,
+          scope: metadata?.scope || "workspace",
+          type: metadata?.type || "fact",
+          status: metadata?.status || "active",
+          ...metadata,
+        },
+      };
+
+      collection.upsertSync(doc);
+    },
+
+    query(
+      embedding: number[],
+      topK: number,
+      filter?: string
+    ): VectorHit[] {
+      const queryParams = {
+        fieldName: "embedding",
+        vector: embedding,
+        topk: topK,
+        filter: filter,
+        outputFields: ["memory_id", "workspace", "scope", "type", "status"],
+        params: {
+          indexType: z.ZVecIndexType.HNSW,
+          ef: 128,
+        },
+      };
+
+      const results = collection.querySync(queryParams);
+
+      return results.map((doc: any) => ({
+        id: doc.fields.memory_id as string,
+        distance: 1 - doc.score,
+        score: doc.score,
+        fields: doc.fields,
+      }));
+    },
+
+    delete(id: string): void {
+      collection.deleteSync(id);
+    },
+
+    close(): void {
+      collection.closeSync();
+    },
   };
 }

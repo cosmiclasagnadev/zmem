@@ -1,4 +1,5 @@
 import type { EmbeddingProvider, EmbedRequest, EmbedResult, EmbeddingProviderConfig } from "./types.js";
+import { debug, info } from "../utils/logger.js";
 
 /**
  * LlamaCpp embedding provider using node-llama-cpp
@@ -39,8 +40,8 @@ export class LlamaCppEmbeddingProvider implements EmbeddingProvider {
 
     // TODO: Implement actual node-llama-cpp initialization
     // This is a placeholder that simulates loading
-    console.log(`[LlamaCppProvider] Loading model: ${this.modelPath}`);
-    console.log(`[LlamaCppProvider] Dimensions: ${this.dimensions}, Batch size: ${this.batchSize}`);
+    info(() => `[LlamaCppProvider] Loading model: ${this.modelPath}`);
+    debug(() => `[LlamaCppProvider] Dimensions: ${this.dimensions}, Batch size: ${this.batchSize}`);
     
     // Simulate model loading delay
     await new Promise(resolve => setTimeout(resolve, 100));
@@ -59,7 +60,7 @@ export class LlamaCppEmbeddingProvider implements EmbeddingProvider {
 
     // TODO: Implement actual embedding generation with node-llama-cpp
     // For now, return a random vector as a placeholder
-    console.log(`[LlamaCppProvider] Embedding text (${text.length} chars)`);
+    debug(() => `[LlamaCppProvider] Embedding text (${text.length} chars)`);
     
     // Generate deterministic pseudo-random embedding based on text hash
     const embedding: number[] = [];
@@ -95,7 +96,7 @@ export class LlamaCppEmbeddingProvider implements EmbeddingProvider {
     for (let i = 0; i < requests.length; i += this.batchSize) {
       const batch = requests.slice(i, i + this.batchSize);
       
-      console.log(`[LlamaCppProvider] Processing batch ${Math.floor(i / this.batchSize) + 1}/${Math.ceil(requests.length / this.batchSize)}`);
+      debug(() => `[LlamaCppProvider] Processing batch ${Math.floor(i / this.batchSize) + 1}/${Math.ceil(requests.length / this.batchSize)}`);
 
       for (const req of batch) {
         const embedding = await this.embed(req.text);
@@ -131,6 +132,6 @@ export class LlamaCppEmbeddingProvider implements EmbeddingProvider {
     this.disposed = true;
     this.initialized = false;
     
-    console.log("[LlamaCppProvider] Disposed");
+    debug(() => "[LlamaCppProvider] Disposed");
   }
 }
