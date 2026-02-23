@@ -33,6 +33,7 @@ export function runMigrations(handle: DbHandle): void {
   db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_items_workspace_status ON memory_items(workspace, status);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_items_supersedes ON memory_items(supersedes_id);`);
   db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_items_content_hash ON memory_items(content_hash);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_items_source_workspace_status ON memory_items(source, workspace, status);`);
 
   // Content chunks table for embedding storage
   db.exec(`
@@ -44,12 +45,14 @@ export function runMigrations(handle: DbHandle): void {
       token_count INTEGER NOT NULL,
       chunk_text TEXT NOT NULL,
       created_at TEXT NOT NULL,
+      deleted_at TEXT,
       FOREIGN KEY (memory_id) REFERENCES memory_items(id) ON DELETE CASCADE,
       UNIQUE(memory_id, seq)
     );
   `);
 
   db.exec(`CREATE INDEX IF NOT EXISTS idx_chunks_memory ON content_chunks(memory_id);`);
+  db.exec(`CREATE INDEX IF NOT EXISTS idx_chunks_deleted ON content_chunks(deleted_at) WHERE deleted_at IS NULL;`);
 
   // Track which chunks have been embedded (zvec stores the actual vectors)
   db.exec(`
@@ -91,14 +94,10 @@ export function runMigrations(handle: DbHandle): void {
 
   db.exec(`
     CREATE TRIGGER IF NOT EXISTS memory_items_au AFTER UPDATE ON memory_items
+    WHEN old.status = 'active' OR new.status = 'active'
     BEGIN
-      -- Delete from FTS if no longer active
-      DELETE FROM memory_items_fts WHERE rowid = old.rowid AND new.status != 'active';
-      
-      -- Update FTS if still/newly active
-      INSERT OR REPLACE INTO memory_items_fts(rowid, title, content, tags)
-      SELECT new.rowid, new.title, new.content, new.tags
-      WHERE new.status = 'active';
+      -- Delete old FTS entry
+      DELETE FROM memory_items_fts WHERE rowid = old.rowid;
     END;
   `);
 
