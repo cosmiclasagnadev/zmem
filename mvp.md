@@ -140,17 +140,28 @@ Project scaffold initialized:
 - Reindex command support
 - Test docs ingested successfully
 
-## Phase 3: Retrieval Pipeline
+## ~~Phase 3: Retrieval Pipeline~~ ✅ COMPLETED
 
 **Goal:** Hybrid search that returns ranked results from both lexical and vector paths.
 
-- [ ] Lexical search: FTS5 query -> BM25 scoring -> normalize to 0..1
-- [ ] Vector search: embed query via node-llama-cpp -> zvec `query()` -> cosine similarity scores
-- [ ] RRF fusion with constants (first list weight 2.0, top-rank bonus +0.05, candidate limit 30)
-- [ ] Filtering: `scope`, `type`, `status`, `include_superseded` (default false)
-- [ ] Superseded handling: exclude items where `supersedes_id IS NOT NULL AND status != 'active'` targets exist
-- [ ] Return payload: `id`, `title`, `snippet`, `score`, `source` (lex/vec/hybrid), `scope`, `type`
+- [x] Lexical search: FTS5 query -> BM25 scoring -> normalize to 0..1
+- [x] Vector search: embed query via node-llama-cpp -> zvec `query()` -> cosine similarity scores
+- [x] RRF fusion with constants (first list weight 2.0, top-rank bonus +0.05, candidate limit 30)
+- [x] Filtering: `scope`, `type`, `status`, `include_superseded` (default false)
+- [x] Superseded handling: exclude items where `supersedes_id IS NOT NULL AND status != 'active'` targets exist
+- [x] Return payload: `id`, `title`, `snippet`, `score`, `source` (lex/vec/hybrid), `scope`, `type`
 - **Acceptance:** `recall` returns sensible results for both keyword and semantic queries; superseded items are hidden by default
+
+**Status:** Implemented with full code review and optimization:
+- Lexical search via FTS5/BM25 with snippet highlighting
+- Vector search via zvec HNSW index with batch DB lookup (N+1 → 1 query)
+- RRF fusion with configurable weights and edge-case handling
+- Workspace isolation via zvec metadata field
+- FTS UPDATE trigger fixed (re-inserts on update, removes on soft-delete)
+- Migration versioning for schema updates
+- Type safety: mode validation, MemoryType filtering, renamed VectorSearchHit
+- Resource cleanup with proper `finally` blocks
+- All dead code removed
 
 ## Phase 4: Core API + Commands
 
