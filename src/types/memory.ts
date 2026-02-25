@@ -18,7 +18,7 @@ export interface MemoryItem {
   scope: MemoryScope;
   tags: string[];
   importance: number;
-  status: "active" | "archived" | "deleted";
+  status: "pending" | "active" | "archived" | "deleted";
   supersedesId: string | null;
   createdAt: string;
   updatedAt: string;

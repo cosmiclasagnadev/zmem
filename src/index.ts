@@ -10,7 +10,7 @@ import {
   ProgressReporter,
   getIngestStats,
 } from "./ingest/index.js";
-import { queryMemories } from "./search/index.js";
+import { createCoreContext, recall } from "./core/index.js";
 import type { MemoryType } from "./types/memory.js";
 import { initLogger } from "./utils/logger.js";
 import { mkdirSync, existsSync } from "node:fs";
@@ -219,12 +219,19 @@ async function handleQuery(args: string[]): Promise<void> {
         )
       : undefined;
 
-    const results = await queryMemories(db, embedProvider, collection, {
-      query: queryArg,
+    // Use core API for search
+    const ctx = createCoreContext({
+      db,
+      embedProvider,
+      vectorCollection: collection,
       workspace: workspaceName,
-      mode: modeArg || "hybrid",
+      config,
+    });
+    
+    const results = await recall(ctx, queryArg, {
       scopes,
       types,
+      mode: modeArg || "hybrid",
     });
 
     if (results.length === 0) {

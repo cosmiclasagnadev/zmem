@@ -163,18 +163,41 @@ Project scaffold initialized:
 - Resource cleanup with proper `finally` blocks
 - All dead code removed
 
-## Phase 4: Core API + Commands
+## ~~Phase 4: Core API + Commands~~ ✅ COMPLETED
 
 **Goal:** Internal service layer that MCP and CLI both call.
 
-- [ ] `save(item)` — create/update memory item, supports `supersedes_id`
-- [ ] `recall(query, filters)` — hybrid search with defaults
-- [ ] `get(id)` — fetch single memory item by id
-- [ ] `list(filters)` — paginated list with type/scope/status filters
-- [ ] `delete(id)` — soft-delete (set status = "deleted")
-- [ ] `reindex()` — clear vectors + re-embed all active items
-- [ ] `status()` — total items, total vectors, pending embeddings, last indexed timestamp
+- [x] `save(item)` — create/update memory item, supports `supersedes_id`
+- [x] `recall(query, filters)` — hybrid search with defaults
+- [x] `get(id)` — fetch single memory item by id
+- [x] `list(filters)` — paginated list with type/scope/status filters
+- [x] `delete(id)` / `deleteMemory(id)` — soft-delete (set status = "deleted")
+- [x] `reindex()` — clear vectors + re-embed all active items
+- [x] `status()` — total items, total vectors, pending embeddings, last indexed timestamp
 - **Acceptance:** all operations work via direct function calls; `save` + `recall` round-trip produces correct results
+
+**Status:** Implemented in `src/core/`:
+- `types.ts` - Zod schemas and TypeScript types
+- `context.ts` - CoreContext for dependency injection
+- `utils.ts` - Helper functions (mapping, validation)
+- `save.ts` - Create/update with chunking and embedding
+- `get.ts` - Fetch single item by ID
+- `list.ts` - Paginated list with filters
+- `delete.ts` - Soft delete implementation
+- `recall.ts` - Hybrid search wrapper
+- `reindex.ts` - Clear and re-embed all items
+- `status.ts` - System status with counts
+- `index.ts` - Main exports
+- `vector-sync.ts` - Vector lifecycle synchronization helpers
+
+**Architecture:** Clean separation between core API and infrastructure layers. CLI refactored to use core API (`createCoreContext` + `recall`).
+
+**Hardening done in Phase 4:**
+- Two-phase save (`pending` -> `active`) with compensation paths to avoid DB/vector drift
+- Supersede safety: old item must be `active`, then archived only after new item finalizes
+- Vector lifecycle sync on delete/reindex/supersede to prevent stale vector hits
+- Workspace-scoped status timestamps (`lastIndexedAt`) and stricter input validation
+- Verification script added: `npm run verify:phase4`
 
 ## Phase 5: MCP Server
 

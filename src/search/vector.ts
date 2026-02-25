@@ -56,10 +56,12 @@ function buildZvecFilter(
 interface MemoryLookup {
   title: string;
   content: string;
+  status: string;
 }
 
 function batchLookupMemories(
   db: DbHandle,
+  workspace: string | undefined,
   memoryIds: string[]
 ): Map<string, MemoryLookup> {
   const result = new Map<string, MemoryLookup>();
@@ -67,14 +69,16 @@ function batchLookupMemories(
 
   const unique = [...new Set(memoryIds)];
   const placeholders = unique.map(() => "?").join(", ");
+  const workspaceClause = workspace ? "AND workspace = ?" : "";
+  const params = workspace ? [...unique, workspace] : unique;
   const rows = db.db
     .prepare(
-      `SELECT id, title, content FROM memory_items WHERE id IN (${placeholders})`
+      `SELECT id, title, content, status FROM memory_items WHERE id IN (${placeholders}) ${workspaceClause} AND status = 'active'`
     )
-    .all(...unique) as Array<{ id: string; title: string; content: string }>;
+    .all(...params) as Array<{ id: string; title: string; content: string; status: string }>;
 
   for (const row of rows) {
-    result.set(row.id, { title: row.title, content: row.content });
+    result.set(row.id, { title: row.title, content: row.content, status: row.status });
   }
 
   return result;
@@ -123,22 +127,25 @@ export async function searchVector(
 
     // Extract unique memory IDs and batch-fetch from DB
     const memoryIds = results.map((hit) => hit.id.replace(/_[0-9]+$/, ""));
-    const lookup = batchLookupMemories(db, memoryIds);
+    const lookup = batchLookupMemories(db, workspace, memoryIds);
 
-    return results.map((hit, i) => {
+    return results
+      .map((hit, i) => {
       const memoryId = memoryIds[i];
       const mem = lookup.get(memoryId);
+      if (!mem) return null;
       return {
         id: memoryId,
-        title: mem?.title || "",
-        snippet: mem ? extractSnippet(mem.content, query) : "",
+        title: mem.title,
+        snippet: extractSnippet(mem.content, query),
         score: hit.score,
         source: "vec" as const,
         scope: (hit.fields.scope as MemoryScope) || "workspace",
         type: (hit.fields.type as MemoryType) || "fact",
-        status: (hit.fields.status as string) || "active",
+        status: mem.status,
       };
-    });
+    })
+      .filter((hit): hit is VectorSearchHit => hit !== null);
   } catch (err) {
     error(() => `[VectorSearch] Error: ${err}`);
     return [];
