@@ -1,20 +1,53 @@
 {
   "name": "zmem",
   "version": "0.1.0",
-  "private": true,
+  "private": false,
   "type": "module",
   "description": "Local-first hybrid memory with zvec + FTS + MCP",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/cosmiclasagnadev/zmem.git"
+  },
+  "bugs": {
+    "url": "https://github.com/cosmiclasagnadev/zmem/issues"
+  },
+  "homepage": "https://github.com/cosmiclasagnadev/zmem#readme",
+  "keywords": [
+    "memory",
+    "mcp",
+    "vector-search",
+    "fts",
+    "sqlite",
+    "zvec",
+    "rag",
+    "local-first"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "bin": {
+    "zmem": "dist/index.js"
+  },
+  "files": [
+    "dist/**/*",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "config.example.json"
+  ],
   "scripts": {
     "dev": "tsx src/index.ts",
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
-    "test": "node --test",
+    "test": "tsx --test test/**/*.test.ts",
     "test:lexical": "tsx --test test/lexical.sanitization.test.ts",
     "smoke": "npm run build && tsx scripts/smoke.ts",
     "smoke:core": "npm run build && tsx scripts/smoke.ts --only=core",
     "smoke:mcp": "npm run build && tsx scripts/smoke.ts --only=mcp",
-    "smoke:verbose": "ZMEM_MCP_VERBOSE=true npm run smoke"
+    "smoke:verbose": "ZMEM_MCP_VERBOSE=true npm run smoke",
+    "prepack": "npm run build"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.4",

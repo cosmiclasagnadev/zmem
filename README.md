@@ -18,6 +18,9 @@ References:
 
 ## What this does differently
 - explicit memory types and lifecycle (pending, active, archived, deleted) plus supersedes_id
+  - if no explicit type is defined, it defaults to 'fact'
+  - if no explicit tags are defined, it defaults to '[]' 
+- **no concrete query expansion step yet** since graph traversal is part of pipeline and I'm not sure how to effectively do query expansion once graph comes in to play
 - uses `@zvec/zvec` for dense retrieval when doing vector search
 
 ## Architecture (high level)
@@ -76,7 +79,6 @@ At runtime, the same core API powers both CLI commands and MCP tools, so behavio
 - `src/mcp/` - MCP server + tool registration
 - `src/db/` - SQLite handling + migrations
 - `config.example.json` - sample configuration
-- `mvp.md` - original scope and phased plan
 
 ## Getting started
 
