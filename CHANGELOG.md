@@ -9,6 +9,9 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 ### Added
 - Open-source readiness updates: MIT license, CI workflow, and repository hygiene improvements.
 
+### Changed
+- npm package distribution updated to scoped publishing under `@cosmiclasagnadev/zmem`.
+
 ## [0.1.0] - 2026-02-26
 
 ### Added

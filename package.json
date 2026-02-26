@@ -1,5 +1,5 @@
 {
-  "name": "zmem",
+  "name": "@cosmiclasagnadev/zmem",
   "version": "0.1.0",
   "private": false,
   "type": "module",
@@ -13,6 +13,9 @@
     "url": "https://github.com/cosmiclasagnadev/zmem/issues"
   },
   "homepage": "https://github.com/cosmiclasagnadev/zmem#readme",
+  "publishConfig": {
+    "access": "public"
+  },
   "keywords": [
     "memory",
     "mcp",

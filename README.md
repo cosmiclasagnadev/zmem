@@ -12,6 +12,13 @@ Local-first hybrid memory for engineering workflows.
 
 overall it is a local-first, agent-oriented memory substrate for engineering decisions and evolving project context
 
+Install from npm (global CLI):
+
+```bash
+npm install -g @cosmiclasagnadev/zmem
+zmem help
+```
+
 References:
 - [QMD](https://github.com/tobi/qmd)
 - [ZVec](https://github.com/alibaba/zvec)
