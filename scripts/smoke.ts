@@ -1,5 +1,6 @@
-import { mkdirSync } from "node:fs";
-import { dirname } from "node:path";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, join, resolve } from "node:path";
+import { tmpdir } from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { loadAppConfig } from "../src/config/loadConfig.js";
@@ -18,6 +19,7 @@ import {
   status,
   type CoreContext,
 } from "../src/core/index.js";
+import { ingestWorkspace, getIngestStats } from "../src/ingest/index.js";
 import { initializeVectorStore, type VectorCollection, type VectorStore } from "../src/vectors/index.js";
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -99,6 +101,31 @@ class Harness {
     return this.vectorStore.createCollection(workspace, this.config.ai.embedding.dimensions);
   }
 
+  async ingestDocs(workspace: string, workspacePath: string): Promise<void> {
+    assert(this.db, "DB not initialized");
+    assert(this.embedProvider, "Embedding provider not initialized");
+    const collection =
+      this.collections.get(workspace) ??
+      this.vectorStore?.openCollection(workspace) ??
+      this.vectorStore?.createCollection(workspace, this.config.ai.embedding.dimensions);
+    assert(collection, "Vector collection not initialized");
+    this.collections.set(workspace, collection);
+
+    await ingestWorkspace({
+      workspace,
+      workspacePath,
+      patterns: ["**/*.md"],
+      db: this.db,
+      vectorStore: collection,
+      embedProvider: this.embedProvider,
+    });
+  }
+
+  getStats(workspace: string): { total: number; active: number; deleted: number; archived: number; chunks: number } {
+    assert(this.db, "DB not initialized");
+    return getIngestStats(this.db, workspace);
+  }
+
   get zvecPath(): string {
     return this.config.storage.zvecPath;
   }
@@ -125,6 +152,7 @@ type McpSession = {
 async function startMcpSession(params: {
   workspace: string;
   env?: Record<string, string>;
+  configPath?: string;
 }): Promise<McpSession> {
   let stderr = "";
   const inheritedEnv = Object.fromEntries(
@@ -132,7 +160,12 @@ async function startMcpSession(params: {
   );
   const transport = new StdioClientTransport({
     command: "node",
-    args: ["dist/index.js", "mcp", `--workspace=${params.workspace}`],
+    args: [
+      "dist/index.js",
+      "mcp",
+      `--workspace=${params.workspace}`,
+      ...(params.configPath ? [`--config=${params.configPath}`] : []),
+    ],
     cwd: process.cwd(),
     env: {
       ...inheritedEnv,
@@ -165,16 +198,22 @@ async function closeMcpSession(session: McpSession): Promise<void> {
 }
 
 async function main(): Promise<void> {
+  const onlyArg = process.argv.find((arg) => arg.startsWith("--only="))?.split("=")[1];
+  const runCore = !onlyArg || onlyArg === "core";
+  const runMcp = !onlyArg || onlyArg === "mcp";
+
   const runId = Date.now();
   const workspace = `smoke-core-${runId}`;
   const workspaceB = `smoke-core-b-${runId}`;
   const workspaceEmpty = `smoke-empty-${runId}`;
+  const workspaceIngest = `smoke-ingest-${runId}`;
   const mcpWorkspace = `smoke-mcp-${runId}`;
   const harness = new Harness();
   await harness.init();
 
   try {
-    await runCase("core happy path", async () => {
+    if (runCore) {
+      await runCase("core happy path", async () => {
       const ctx = harness.context(workspace);
       const token = `smokehappy${runId}`;
 
@@ -202,9 +241,23 @@ async function main(): Promise<void> {
       assert(!secondDelete, "Expected second delete to return false");
       const hitsAfterDelete = await recall(ctx, token, { mode: "hybrid" });
       assert(!hitsAfterDelete.some((h) => h.id === created.id), "Deleted item should be hidden by recall");
-    });
+      });
 
-    await runCase("supersede lifecycle", async () => {
+      await runCase("ingest fixture docs and idempotency", async () => {
+      const fixturePath = resolve(process.cwd(), "test-docs/search");
+
+      await harness.ingestDocs(workspaceIngest, fixturePath);
+      const firstStats = harness.getStats(workspaceIngest);
+      assert(firstStats.total > 0, "Fixture ingest should create memory items");
+      assert(firstStats.chunks > 0, "Fixture ingest should create chunks");
+
+      await harness.ingestDocs(workspaceIngest, fixturePath);
+      const secondStats = harness.getStats(workspaceIngest);
+      assert(secondStats.total === firstStats.total, "Re-ingest should not inflate total docs");
+      assert(secondStats.chunks === firstStats.chunks, "Re-ingest should not inflate chunk count");
+      });
+
+      await runCase("supersede lifecycle", async () => {
       const ctx = harness.context(workspace);
       const key = `smokesupersede${runId}`;
       const oldOnly = `smokeoldonly${runId}`;
@@ -252,9 +305,9 @@ async function main(): Promise<void> {
 
       const current = await recall(ctx, key, { includeSuperseded: true, mode: "hybrid" });
       assert(current.some((h) => h.id === second.id), "Superseding item should remain visible");
-    });
+      });
 
-    await runCase("workspace isolation", async () => {
+      await runCase("workspace isolation", async () => {
       const ctxA = harness.context(workspace);
       const ctxB = harness.context(workspaceB);
       const tokenA = `smokeworkspacea${runId}`;
@@ -287,9 +340,41 @@ async function main(): Promise<void> {
       const statusB = await status(ctxB);
       assert(statusA.totalItems > 0, "Workspace A should have items");
       assert(statusB.totalItems > 0, "Workspace B should have items");
-    });
+      });
 
-    await runCase("reindex behavior", async () => {
+      await runCase("explicit lexical and vector recall modes", async () => {
+      const ctx = harness.context(workspace);
+      const lexicalToken = `lexicalkeyword${runId}`;
+      const semanticText = `semantic memory retrieval benchmark sentence ${runId}`;
+
+      const lexicalItem = await save(ctx, {
+        type: "fact",
+        title: `Lexical ${lexicalToken}`,
+        content: `This doc includes ${lexicalToken} for lexical assertions`,
+        source: "smoke",
+        scope: "workspace",
+      });
+
+      const semanticItem = await save(ctx, {
+        type: "decision",
+        title: `Semantic ${runId}`,
+        content: semanticText,
+        source: "smoke",
+        scope: "workspace",
+      });
+
+      const lexicalHits = await recall(ctx, lexicalToken, { mode: "lexical" });
+      assert(lexicalHits.some((h) => h.id === lexicalItem.id), "Lexical mode should return keyword hit");
+
+      const vectorHits = await recall(ctx, semanticText, { mode: "vector" });
+      assert(vectorHits.length > 0, "Vector mode should return at least one hit");
+      assert(
+        vectorHits.some((h) => h.id === semanticItem.id),
+        "Vector mode should include semantically matching item"
+      );
+      });
+
+      await runCase("reindex behavior", async () => {
       const ctx = harness.context(workspace);
       const ctxEmpty = harness.context(workspaceEmpty);
 
@@ -303,9 +388,17 @@ async function main(): Promise<void> {
       const empty = await reindex(ctxEmpty);
       assert(empty.processed === 0, "Empty workspace reindex should process zero items");
       assert(empty.errors === 0, "Empty workspace reindex should have zero errors");
-    });
+      });
 
-    await runCase("duplicate and long-content saves", async () => {
+      await runCase("empty corpus recall", async () => {
+      const ctxEmpty = harness.context(`smoke-empty-recall-${runId}`);
+      const hits = await recall(ctxEmpty, `nothinghere${runId}`, { mode: "hybrid" });
+      assert(hits.length === 0, "Empty workspace recall should return no hits");
+      const st = await status(ctxEmpty);
+      assert(st.totalItems === 0, "Empty workspace should have zero items");
+      });
+
+      await runCase("duplicate and long-content saves", async () => {
       const ctx = harness.context(workspace);
       const dupToken = `smokeduplicate${runId}`;
       const payload = {
@@ -333,9 +426,9 @@ async function main(): Promise<void> {
       });
       const longHits = await recall(ctx, longToken, { mode: "hybrid" });
       assert(longHits.some((h) => h.id === longSaved.id), "Long content should remain recallable");
-    });
+      });
 
-    await runCase("special-char content and concurrent saves", async () => {
+      await runCase("special-char content and concurrent saves", async () => {
       const ctx = harness.context(workspace);
       const punctToken = `oauth2 beta users flow ${runId}`;
 
@@ -369,9 +462,9 @@ async function main(): Promise<void> {
         const fetched = await get(ctx, item.id);
         assert(fetched !== null, `Expected concurrent item ${item.id} to exist`);
       }
-    });
+      });
 
-    await runCase("config load isolation", async () => {
+      await runCase("config load isolation", async () => {
       const originalModel = process.env.ZMD_EMBED_MODEL;
       const originalProvider = process.env.ZMD_EMBED_PROVIDER;
       try {
@@ -404,16 +497,58 @@ async function main(): Promise<void> {
           process.env.ZMD_EMBED_PROVIDER = originalProvider;
         }
       }
-    });
+      });
 
-    await runCase("vector stale-path recovery", async () => {
+      await runCase("invalid config and corrupt DB error paths", async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), "zmem-smoke-errors-"));
+      const invalidJsonPath = join(tempDir, "invalid-config.json");
+      const invalidSchemaPath = join(tempDir, "invalid-schema.json");
+      const corruptDbPath = join(tempDir, "corrupt.db");
+
+      try {
+        writeFileSync(invalidJsonPath, "{\"defaults\": ");
+        await expectThrows(
+          async () => {
+            loadAppConfig(invalidJsonPath, { silent: true });
+          },
+          "Invalid JSON config should throw"
+        );
+
+        writeFileSync(invalidSchemaPath, JSON.stringify({ defaults: { retrievalMode: "invalid-mode" } }));
+        await expectThrows(
+          async () => {
+            loadAppConfig(invalidSchemaPath, { silent: true });
+          },
+          "Schema-invalid config should throw"
+        );
+
+        writeFileSync(corruptDbPath, "not a sqlite database");
+        await expectThrows(
+          async () => {
+            const badDb = openDatabase(corruptDbPath);
+            try {
+              runMigrations(badDb);
+            } finally {
+              closeDatabase(badDb);
+            }
+          },
+          "Corrupt database should fail open or migrations"
+        );
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+      });
+
+      await runCase("vector stale-path recovery", async () => {
       const staleWorkspace = `smoke-stale-${runId}`;
       mkdirSync(`${harness.zvecPath}/${staleWorkspace}`, { recursive: true });
       const collection = harness.createCollectionRaw(staleWorkspace);
       collection.close();
-    });
+      });
+    }
 
-    await runCase("mcp contracts and validation", async () => {
+    if (runMcp) {
+      await runCase("mcp contracts and validation", async () => {
       const session = await startMcpSession({
         workspace: mcpWorkspace,
         env: { ZMEM_MCP_VERBOSE: "true" },
@@ -423,6 +558,14 @@ async function main(): Promise<void> {
         const names = tools.tools.map((t) => t.name).sort();
         assert(names.includes("memory_query"), "memory_query should be registered");
         assert(!names.includes("memory_reindex"), "memory_reindex should be disabled by default");
+
+        const emptyResult = await session.client.callTool({
+          name: "memory_query",
+          arguments: { query: `emptycorpus${runId}`, mode: "hybrid", limit: 5 },
+        });
+        assert(!emptyResult.isError, "memory_query on empty corpus should not error");
+        const emptyCount = (emptyResult.structuredContent as { count?: number } | undefined)?.count;
+        assert(emptyCount === 0, "Empty corpus query should return count=0");
 
         const secretQuery = `mcpsecretquery${runId}`;
         const saveResult = await session.client.callTool({
@@ -483,9 +626,42 @@ async function main(): Promise<void> {
       } finally {
         await closeMcpSession(session);
       }
-    });
+      });
 
-    await runCase("mcp reindex tool flag", async () => {
+      await runCase("mcp startup error paths", async () => {
+      const tempDir = mkdtempSync(join(tmpdir(), "zmem-mcp-config-"));
+      const missingConfigPath = join(tempDir, "missing-config.json");
+      await expectThrows(
+        async () => {
+          const session = await startMcpSession({
+            workspace: `smoke-mcp-error-${runId}`,
+            env: { ZMD_EMBED_PROVIDER: "openai" },
+            configPath: missingConfigPath,
+          });
+          await closeMcpSession(session);
+        },
+        "Unsupported embedding provider should fail MCP startup"
+      );
+
+      const badConfig = join(tempDir, "bad-config.json");
+      try {
+        writeFileSync(badConfig, "{\"workspaces\":");
+        await expectThrows(
+          async () => {
+            const session = await startMcpSession({
+              workspace: `smoke-mcp-badcfg-${runId}`,
+              configPath: badConfig,
+            });
+            await closeMcpSession(session);
+          },
+          "Invalid MCP config should fail startup"
+        );
+      } finally {
+        rmSync(tempDir, { recursive: true, force: true });
+      }
+      });
+
+      await runCase("mcp reindex tool flag", async () => {
       const session = await startMcpSession({
         workspace: mcpWorkspace,
         env: { ZMEM_ENABLE_REINDEX_TOOL: "true" },
@@ -497,7 +673,8 @@ async function main(): Promise<void> {
       } finally {
         await closeMcpSession(session);
       }
-    });
+      });
+    }
   } finally {
     await harness.close();
   }

@@ -125,73 +125,6 @@ export function searchLexical(
     return mapRows(rows ?? []);
   };
 
-  const searchArchivedFallback = (tokensForFallback: string[]): LexicalHit[] => {
-    if (!statuses.includes("archived") || tokensForFallback.length === 0) {
-      return [];
-    }
-
-    const conditions: string[] = ["status = 'archived'"];
-    const params: unknown[] = [];
-
-    if (workspace) {
-      conditions.push("workspace = ?");
-      params.push(workspace);
-    }
-
-    if (scopes && scopes.length > 0) {
-      const placeholders = scopes.map(() => "?").join(", ");
-      conditions.push(`scope IN (${placeholders})`);
-      params.push(...scopes);
-    }
-
-    if (types && types.length > 0) {
-      const placeholders = types.map(() => "?").join(", ");
-      conditions.push(`type IN (${placeholders})`);
-      params.push(...types);
-    }
-
-    const tokenClauses = tokensForFallback
-      .map(() => "(LOWER(title) LIKE ? OR LOWER(content) LIKE ?)")
-      .join(" AND ");
-    conditions.push(tokenClauses);
-    for (const token of tokensForFallback) {
-      const pattern = `%${token}%`;
-      params.push(pattern, pattern);
-    }
-
-    params.push(topK);
-
-    const rows = db.db
-      .prepare(
-        `
-        SELECT id, title, content, scope, type, status
-        FROM memory_items
-        WHERE ${conditions.join(" AND ")}
-        ORDER BY updated_at DESC
-        LIMIT ?
-      `
-      )
-      .all(...params) as Array<{
-      id: string;
-      title: string;
-      content: string;
-      scope: MemoryScope;
-      type: MemoryType;
-      status: string;
-    }>;
-
-    return rows.map((row) => ({
-      id: row.id,
-      title: row.title,
-      snippet: row.content.slice(0, 200),
-      score: 0.35,
-      source: "lex",
-      scope: row.scope,
-      type: row.type,
-      status: row.status,
-    }));
-  };
-
   const sql = `
     SELECT
       m.id,
@@ -220,51 +153,15 @@ export function searchLexical(
     const strictQuery = buildMatchQuery(tokens, "and");
     const strictHits = executeSearch(strictQuery);
     if (strictHits.length > 0) {
-      const archivedHits = searchArchivedFallback(tokens);
-      const merged = [...strictHits, ...archivedHits];
-      const deduped = new Map<string, LexicalHit>();
-      for (const hit of merged) {
-        const existing = deduped.get(hit.id);
-        if (!existing || hit.score > existing.score) {
-          deduped.set(hit.id, hit);
-        }
-      }
-      return [...deduped.values()].sort((a, b) => b.score - a.score).slice(0, topK);
+      return strictHits;
     }
 
     if (tokens.length === 1) {
-      const archivedHits = searchArchivedFallback(tokens);
-      const merged = [...strictHits, ...archivedHits];
-      if (merged.length === 0) {
-        return merged;
-      }
-      const deduped = new Map<string, LexicalHit>();
-      for (const hit of merged) {
-        const existing = deduped.get(hit.id);
-        if (!existing || hit.score > existing.score) {
-          deduped.set(hit.id, hit);
-        }
-      }
-      return [...deduped.values()].sort((a, b) => b.score - a.score).slice(0, topK);
+      return strictHits;
     }
 
     const relaxedQuery = buildMatchQuery(tokens, "or");
-    const activeHits = executeSearch(relaxedQuery);
-    const archivedHits = searchArchivedFallback(tokens);
-    const merged = [...activeHits, ...archivedHits];
-    if (merged.length === 0) {
-      return merged;
-    }
-
-    const deduped = new Map<string, LexicalHit>();
-    for (const hit of merged) {
-      const existing = deduped.get(hit.id);
-      if (!existing || hit.score > existing.score) {
-        deduped.set(hit.id, hit);
-      }
-    }
-
-    return [...deduped.values()].sort((a, b) => b.score - a.score).slice(0, topK);
+    return executeSearch(relaxedQuery);
   } catch (err) {
     error(() => `[LexicalSearch] FTS query error (queryLen=${query.length}): ${err}`);
     return [];

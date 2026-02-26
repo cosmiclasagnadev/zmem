@@ -12,6 +12,8 @@
     "test": "node --test",
     "test:lexical": "tsx --test test/lexical.sanitization.test.ts",
     "smoke": "npm run build && tsx scripts/smoke.ts",
+    "smoke:core": "npm run build && tsx scripts/smoke.ts --only=core",
+    "smoke:mcp": "npm run build && tsx scripts/smoke.ts --only=mcp",
     "smoke:verbose": "ZMEM_MCP_VERBOSE=true npm run smoke"
   },
   "dependencies": {

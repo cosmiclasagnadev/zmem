@@ -52,11 +52,8 @@ function searchArchivedByKeyword(
     return [];
   }
 
-  const clauses: string[] = [];
+  const clauses: string[] = ["workspace = ?", "status = 'archived'"];
   const params: unknown[] = [input.workspace];
-
-  clauses.push("workspace = ?");
-  clauses.push("status = 'archived'");
 
   if (input.scopes.length > 0) {
     const scopePlaceholders = input.scopes.map(() => "?").join(", ");
@@ -179,14 +176,16 @@ export async function queryMemories(
       types,
       topK,
     });
-    const byId = new Map<string, SearchHit>();
-    for (const hit of [...results, ...archivedHits]) {
-      const existing = byId.get(hit.id);
-      if (!existing || hit.score > existing.score) {
-        byId.set(hit.id, hit);
+    if (archivedHits.length > 0) {
+      const byId = new Map<string, SearchHit>();
+      for (const hit of [...results, ...archivedHits]) {
+        const existing = byId.get(hit.id);
+        if (!existing || hit.score > existing.score) {
+          byId.set(hit.id, hit);
+        }
       }
+      results = [...byId.values()].sort((a, b) => b.score - a.score);
     }
-    results = [...byId.values()].sort((a, b) => b.score - a.score);
   }
 
   return results.slice(0, topK).map((r) => ({

@@ -140,7 +140,7 @@ test("lexical falls back from strict AND to OR when needed", () => {
   }
 });
 
-test("status filtering supports active-only and active+archived", () => {
+test("status filtering keeps lexical results constrained to indexed active docs", () => {
   const { handle, cleanup } = createTestDb();
   try {
     seedMemory(handle, [
@@ -174,7 +174,7 @@ test("status filtering supports active-only and active+archived", () => {
       statuses: ["active", "archived"],
     });
     assert.equal(bothHits.some((h) => h.id === "active_1"), true);
-    assert.equal(bothHits.some((h) => h.id === "archived_1"), true);
+    assert.equal(bothHits.some((h) => h.id === "archived_1"), false);
   } finally {
     cleanup();
   }
