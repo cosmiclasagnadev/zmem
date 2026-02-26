@@ -27,29 +27,86 @@ export interface QueryHit {
   type: MemoryType;
 }
 
-function getSupersededIds(
+function tokenizeForArchivedLookup(query: string): string[] {
+  return query
+    .toLowerCase()
+    .replace(/["'`]/g, " ")
+    .split(/[^\p{L}\p{N}_]+/u)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 2)
+    .slice(0, 8);
+}
+
+function searchArchivedByKeyword(
   db: DbHandle,
-  includeSuperseded: boolean
-): Set<string> {
-  if (includeSuperseded) {
-    return new Set();
+  input: {
+    query: string;
+    workspace: string;
+    scopes: MemoryScope[];
+    types?: MemoryType[];
+    topK: number;
   }
+): SearchHit[] {
+  const tokens = tokenizeForArchivedLookup(input.query);
+  if (tokens.length === 0) {
+    return [];
+  }
+
+  const clauses: string[] = [];
+  const params: unknown[] = [input.workspace];
+
+  clauses.push("workspace = ?");
+  clauses.push("status = 'archived'");
+
+  if (input.scopes.length > 0) {
+    const scopePlaceholders = input.scopes.map(() => "?").join(", ");
+    clauses.push(`scope IN (${scopePlaceholders})`);
+    params.push(...input.scopes);
+  }
+
+  if (input.types && input.types.length > 0) {
+    const typePlaceholders = input.types.map(() => "?").join(", ");
+    clauses.push(`type IN (${typePlaceholders})`);
+    params.push(...input.types);
+  }
+
+  const tokenClauses = tokens.map(() => "(LOWER(title) LIKE ? OR LOWER(content) LIKE ?)").join(" AND ");
+  clauses.push(tokenClauses);
+  for (const token of tokens) {
+    const pattern = `%${token}%`;
+    params.push(pattern, pattern);
+  }
+
+  params.push(input.topK);
 
   const rows = db.db
     .prepare(
       `
-    SELECT m.id FROM memory_items m
-    WHERE m.status = 'active'
-    AND m.supersedes_id IS NOT NULL
-    AND EXISTS (
-      SELECT 1 FROM memory_items r
-      WHERE r.id = m.supersedes_id AND r.status = 'active'
+      SELECT id, title, content, scope, type
+      FROM memory_items
+      WHERE ${clauses.join(" AND ")}
+      ORDER BY updated_at DESC
+      LIMIT ?
+      `
     )
-  `
-    )
-    .all() as { id: string }[];
+    .all(...params) as Array<{
+    id: string;
+    title: string;
+    content: string;
+    scope: MemoryScope;
+    type: MemoryType;
+  }>;
 
-  return new Set(rows.map((r) => r.id));
+  return rows.map((row) => ({
+    id: row.id,
+    title: row.title,
+    snippet: row.content.slice(0, 200),
+    score: 0.35,
+    source: "lex" as const,
+    scope: row.scope,
+    type: row.type,
+    status: "archived",
+  }));
 }
 
 export async function queryMemories(
@@ -68,8 +125,7 @@ export async function queryMemories(
     minScore = 0.25,
     mode = "hybrid",
   } = input;
-
-  const supersededIds = getSupersededIds(db, includeSuperseded);
+  const statuses = includeSuperseded ? ["active", "archived"] : ["active"];
 
   const fusionOptions: FusionOptions = {
     candidateLimit: 30,
@@ -86,7 +142,7 @@ export async function queryMemories(
       topK,
       scopes: scopes as MemoryScope[],
       types,
-      status: "active",
+      statuses,
     });
   }
 
@@ -97,7 +153,7 @@ export async function queryMemories(
       topK,
       scopes: scopes as MemoryScope[],
       types,
-      status: "active",
+      statuses,
     });
   }
 
@@ -115,9 +171,25 @@ export async function queryMemories(
     );
   }
 
-  const filtered = results.filter((r) => !supersededIds.has(r.id));
+  if (includeSuperseded) {
+    const archivedHits = searchArchivedByKeyword(db, {
+      query,
+      workspace,
+      scopes: scopes as MemoryScope[],
+      types,
+      topK,
+    });
+    const byId = new Map<string, SearchHit>();
+    for (const hit of [...results, ...archivedHits]) {
+      const existing = byId.get(hit.id);
+      if (!existing || hit.score > existing.score) {
+        byId.set(hit.id, hit);
+      }
+    }
+    results = [...byId.values()].sort((a, b) => b.score - a.score);
+  }
 
-  return filtered.slice(0, topK).map((r) => ({
+  return results.slice(0, topK).map((r) => ({
     id: r.id,
     title: r.title,
     score: r.score,

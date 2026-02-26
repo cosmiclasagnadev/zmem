@@ -1,4 +1,4 @@
-import { mkdirSync, existsSync } from "node:fs";
+import { mkdirSync, existsSync, rmSync } from "node:fs";
 import { info, debug } from "../utils/logger.js";
 
 export interface VectorHit {
@@ -115,8 +115,19 @@ export async function initializeVectorStore(config: {
         collection = z.ZVecOpen(collectionPath);
         debug(() => `[VectorStore] Opened existing collection "${name}"`);
       } catch {
-        collection = z.ZVecCreateAndOpen(collectionPath, schema);
-        debug(() => `[VectorStore] Created new collection "${name}"`);
+        try {
+          collection = z.ZVecCreateAndOpen(collectionPath, schema);
+          debug(() => `[VectorStore] Created new collection "${name}"`);
+        } catch (createError) {
+          const message = createError instanceof Error ? createError.message : String(createError);
+          if (message.includes("is existed")) {
+            rmSync(collectionPath, { recursive: true, force: true });
+            collection = z.ZVecCreateAndOpen(collectionPath, schema);
+            debug(() => `[VectorStore] Recreated invalid collection path "${name}"`);
+          } else {
+            throw createError;
+          }
+        }
       }
 
       return createVectorCollectionWrapper(z, collection);

@@ -21,23 +21,27 @@ export interface VectorSearchOptions {
   topK?: number;
   scopes?: MemoryScope[];
   types?: MemoryType[];
-  status?: string;
+  statuses?: string[];
 }
 
 function buildZvecFilter(
   workspace?: string,
   scopes?: MemoryScope[],
   types?: MemoryType[],
-  status?: string
+  statuses?: string[]
 ): string | undefined {
   const conditions: string[] = [];
+  const escapeFilterValue = (value: string): string => value.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
 
   if (workspace) {
-    conditions.push(`workspace = "${workspace}"`);
+    conditions.push(`workspace = "${escapeFilterValue(workspace)}"`);
   }
 
-  if (status) {
-    conditions.push(`status = "${status}"`);
+  if (statuses && statuses.length > 0) {
+    const statusConditions = statuses
+      .map((s) => `status = "${escapeFilterValue(s)}"`)
+      .join(" or ");
+    conditions.push(`(${statusConditions})`);
   }
 
   if (scopes && scopes.length > 0) {
@@ -62,18 +66,20 @@ interface MemoryLookup {
 function batchLookupMemories(
   db: DbHandle,
   workspace: string | undefined,
-  memoryIds: string[]
+  memoryIds: string[],
+  statuses: string[]
 ): Map<string, MemoryLookup> {
   const result = new Map<string, MemoryLookup>();
   if (memoryIds.length === 0) return result;
 
   const unique = [...new Set(memoryIds)];
   const placeholders = unique.map(() => "?").join(", ");
+  const statusPlaceholders = statuses.map(() => "?").join(", ");
   const workspaceClause = workspace ? "AND workspace = ?" : "";
-  const params = workspace ? [...unique, workspace] : unique;
+  const params = workspace ? [...unique, ...statuses, workspace] : [...unique, ...statuses];
   const rows = db.db
     .prepare(
-      `SELECT id, title, content, status FROM memory_items WHERE id IN (${placeholders}) ${workspaceClause} AND status = 'active'`
+      `SELECT id, title, content, status FROM memory_items WHERE id IN (${placeholders}) AND status IN (${statusPlaceholders}) ${workspaceClause}`
     )
     .all(...params) as Array<{ id: string; title: string; content: string; status: string }>;
 
@@ -109,7 +115,7 @@ export async function searchVector(
   vectorCollection: VectorCollection,
   options: VectorSearchOptions
 ): Promise<VectorSearchHit[]> {
-  const { query, workspace, topK = 30, scopes, types, status = "active" } = options;
+  const { query, workspace, topK = 30, scopes, types, statuses = ["active"] } = options;
 
   if (!query.trim()) {
     return [];
@@ -117,7 +123,7 @@ export async function searchVector(
 
   try {
     const embedding = await embedProvider.embed(query);
-    const filter = buildZvecFilter(workspace, scopes, types, status);
+    const filter = buildZvecFilter(workspace, scopes, types, statuses);
 
     const results = vectorCollection.query(embedding, topK, filter);
 
@@ -127,7 +133,7 @@ export async function searchVector(
 
     // Extract unique memory IDs and batch-fetch from DB
     const memoryIds = results.map((hit) => hit.id.replace(/_[0-9]+$/, ""));
-    const lookup = batchLookupMemories(db, workspace, memoryIds);
+    const lookup = batchLookupMemories(db, workspace, memoryIds, statuses);
 
     return results
       .map((hit, i) => {

@@ -3,7 +3,8 @@ import { resolve } from "node:path";
 import { config as loadDotenv } from "dotenv";
 import { appConfigSchema, type AppConfig } from "./schema.js";
 
-const defaultConfig: AppConfig = {
+function createDefaultConfig(): AppConfig {
+  return {
   defaults: {
     retrievalMode: "hybrid",
     scopesDefault: ["workspace", "global"],
@@ -34,22 +35,37 @@ const defaultConfig: AppConfig = {
     dbPath: "./data/memory.db",
     zvecPath: "./data/vectors",
   },
-};
+  };
+}
 
-export function loadAppConfig(configPath: string = "./config.json"): AppConfig {
+interface LoadConfigOptions {
+  silent?: boolean;
+}
+
+export function loadAppConfig(
+  configPath: string = "./config.json",
+  options: LoadConfigOptions = {}
+): AppConfig {
   loadDotenv();
+
+  const defaultConfig = createDefaultConfig();
 
   // Allow env override for model
   if (process.env.ZMD_EMBED_MODEL) {
     defaultConfig.ai.embedding.model = process.env.ZMD_EMBED_MODEL;
   }
   if (process.env.ZMD_EMBED_PROVIDER) {
-    defaultConfig.ai.embedding.provider = process.env.ZMD_EMBED_PROVIDER as any;
+    const provider = process.env.ZMD_EMBED_PROVIDER;
+    if (provider === "llamacpp" || provider === "openai" || provider === "ollama") {
+      defaultConfig.ai.embedding.provider = provider;
+    }
   }
 
   const absolute = resolve(configPath);
   if (!existsSync(absolute)) {
-    console.log(`⚠️  No config file found at ${configPath}, using defaults`);
+    if (!options.silent) {
+      console.log(`⚠️  No config file found at ${configPath}, using defaults`);
+    }
     return defaultConfig;
   }
 

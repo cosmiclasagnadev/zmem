@@ -11,6 +11,7 @@ import {
   getIngestStats,
 } from "./ingest/index.js";
 import { createCoreContext, recall } from "./core/index.js";
+import { startMcpServer } from "./mcp/index.js";
 import type { MemoryType } from "./types/memory.js";
 import { initLogger } from "./utils/logger.js";
 import { mkdirSync, existsSync } from "node:fs";
@@ -43,6 +44,9 @@ async function main(): Promise<void> {
         break;
       case "query":
         await handleQuery(args.slice(1));
+        break;
+      case "mcp":
+        await handleMcp(args.slice(1));
         break;
       case "help":
       default:
@@ -97,10 +101,9 @@ async function handleIngest(args: string[]): Promise<void> {
   const reporter = new ProgressReporter();
   reporter.start();
 
-  const collection = vectorStore.createCollection(
-    workspaceName,
-    config.ai.embedding.dimensions
-  );
+  const collection =
+    vectorStore.openCollection(workspaceName) ??
+    vectorStore.createCollection(workspaceName, config.ai.embedding.dimensions);
 
   try {
     const result = await ingestWorkspace({
@@ -200,10 +203,9 @@ async function handleQuery(args: string[]): Promise<void> {
   try {
     await embedProvider.initialize();
 
-    collection = vectorStore.createCollection(
-      workspaceName,
-      config.ai.embedding.dimensions
-    );
+    collection =
+      vectorStore.openCollection(workspaceName) ??
+      vectorStore.createCollection(workspaceName, config.ai.embedding.dimensions);
 
     const validScopes = ["workspace", "global", "user"] as const;
     const scopes = scopesArg
@@ -253,6 +255,47 @@ async function handleQuery(args: string[]): Promise<void> {
   }
 }
 
+async function handleMcp(args: string[]): Promise<void> {
+  const configPath = args.find((a) => a.startsWith("--config="))?.split("=")[1];
+  const workspace = args.find((a) => a.startsWith("--workspace="))?.split("=")[1];
+  const verboseFlag = args.find((a) => a.startsWith("--verbose="))?.split("=")[1];
+  const verbose = verboseFlag ? verboseFlag === "true" : undefined;
+
+  initLogger({ verbose: false, quiet: true });
+
+  const handle = await startMcpServer({
+    configPath,
+    workspace,
+    verbose,
+  });
+
+  await new Promise<void>((resolve) => {
+    let shuttingDown = false;
+
+    const shutdown = async () => {
+      if (shuttingDown) {
+        return;
+      }
+      shuttingDown = true;
+      await handle.close();
+      resolve();
+    };
+
+    process.once("SIGINT", () => {
+      void shutdown();
+    });
+    process.once("SIGTERM", () => {
+      void shutdown();
+    });
+    process.stdin.once("end", () => {
+      void shutdown();
+    });
+    process.stdin.once("close", () => {
+      void shutdown();
+    });
+  });
+}
+
 function showHelp(): void {
   console.log(`
 zmem - Local-first hybrid memory system
@@ -265,6 +308,8 @@ Commands:
   status [--workspace=<name>] [--logs=true|false]         Show ingestion status
   query <query> [--workspace=<name>] [--mode=hybrid|lexical|vector] [--logs=true|false]
                                        Search memories
+  mcp [--config=./config.json] [--workspace=<name>] [--verbose=true|false]
+                                       Start MCP stdio server
   help                                 Show this help message
 
 Examples:
@@ -275,6 +320,8 @@ Examples:
   zmem query "database decisions" --mode=hybrid
   zmem query "dark mode" --types=preference
   zmem query "sqlite" --logs=true
+  zmem mcp --workspace=default
+  zmem mcp --workspace=default --verbose=true
 `);
 }
 

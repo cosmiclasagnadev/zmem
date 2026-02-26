@@ -9,7 +9,10 @@
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/index.js",
     "typecheck": "tsc --noEmit",
-    "test": "node --test"
+    "test": "node --test",
+    "test:lexical": "tsx --test test/lexical.sanitization.test.ts",
+    "smoke": "npm run build && tsx scripts/smoke.ts",
+    "smoke:verbose": "ZMEM_MCP_VERBOSE=true npm run smoke"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.4",
