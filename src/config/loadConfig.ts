@@ -24,6 +24,7 @@ function createDefaultConfig(): AppConfig {
       quantization: "Q8_0",
       batchSize: 8,
       maxTokens: 8192,
+      taskType: undefined,
     },
     rerank: {
       enabled: false,
@@ -31,10 +32,7 @@ function createDefaultConfig(): AppConfig {
     },
   },
   workspaces: [],
-  storage: {
-    dbPath: "./data/memory.db",
-    zvecPath: "./data/vectors",
-  },
+  storage: {},
   };
 }
 
@@ -54,11 +52,42 @@ export function loadAppConfig(
   if (process.env.ZMD_EMBED_MODEL) {
     defaultConfig.ai.embedding.model = process.env.ZMD_EMBED_MODEL;
   }
+  if (process.env.ZMD_EMBED_DIMENSIONS) {
+    const dimensions = Number(process.env.ZMD_EMBED_DIMENSIONS);
+    if (Number.isInteger(dimensions) && dimensions > 0) {
+      defaultConfig.ai.embedding.dimensions = dimensions;
+    }
+  }
   if (process.env.ZMD_EMBED_PROVIDER) {
     const provider = process.env.ZMD_EMBED_PROVIDER;
-    if (provider === "llamacpp" || provider === "openai" || provider === "ollama") {
+    if (
+      provider === "llamacpp" ||
+      provider === "openai" ||
+      provider === "ollama" ||
+      provider === "gemini" ||
+      provider === "mock"
+    ) {
       defaultConfig.ai.embedding.provider = provider;
     }
+  }
+  if (process.env.ZMD_EMBED_API_KEY || process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY) {
+    defaultConfig.ai.embedding.apiKey =
+      process.env.ZMD_EMBED_API_KEY || process.env.GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
+  }
+  if (process.env.ZMD_EMBED_BASE_URL) {
+    defaultConfig.ai.embedding.baseUrl = process.env.ZMD_EMBED_BASE_URL;
+  }
+  if (process.env.ZMD_EMBED_TASK_TYPE) {
+    defaultConfig.ai.embedding.taskType = process.env.ZMD_EMBED_TASK_TYPE;
+  }
+  if (process.env.ZMEM_STORAGE_BASE_DIR) {
+    defaultConfig.storage.baseDir = process.env.ZMEM_STORAGE_BASE_DIR;
+  }
+  if (process.env.ZMEM_DB_PATH) {
+    defaultConfig.storage.dbPath = process.env.ZMEM_DB_PATH;
+  }
+  if (process.env.ZMEM_ZVEC_PATH) {
+    defaultConfig.storage.zvecPath = process.env.ZMEM_ZVEC_PATH;
   }
 
   const absolute = resolve(configPath);

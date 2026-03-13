@@ -9,19 +9,26 @@ import { runMigrations } from "../db/migrate.js";
 import { createEmbeddingProvider } from "../embed/factory.js";
 import type { EmbeddingProvider } from "../embed/types.js";
 import {
+  createEdge,
   createCoreContext,
   deleteMemory,
   get,
   list,
+  listNeighbors,
   recall,
   reindex,
   save,
   status,
+  updateEdge,
   CoreError,
+  CreateEdgeInputSchema,
+  ListNeighborsInputSchema,
   SaveMemoryInputSchema,
   RecallFiltersSchema,
+  UpdateEdgeInputSchema,
 } from "../core/index.js";
 import { initializeVectorStore, type VectorCollection, type VectorStore } from "../vectors/index.js";
+import { resolveStoragePaths } from "../storage/paths.js";
 import type { AppConfig } from "../config/schema.js";
 
 const MemoryTypeSchema = SaveMemoryInputSchema.shape.type;
@@ -43,6 +50,27 @@ const MemoryItemSchema = z.object({
   supersedesId: z.string().nullable(),
   createdAt: z.string(),
   updatedAt: z.string(),
+});
+
+const MemoryEdgeSchema = z.object({
+  id: z.string(),
+  fromMemoryId: z.string(),
+  toMemoryId: z.string(),
+  relationType: z.string(),
+  confidence: z.number(),
+  origin: z.enum(["manual", "llm"]),
+  status: z.enum(["suggested", "accepted", "rejected"]),
+  justification: z.string(),
+  acceptedBy: z.enum(["user", "agent", "system"]).nullable(),
+  createdAt: z.string(),
+  updatedAt: z.string(),
+});
+
+const MemoryNeighborSchema = z.object({
+  memory: MemoryItemSchema,
+  edge: MemoryEdgeSchema,
+  direction: z.enum(["outbound", "inbound"]),
+  depth: z.number().int().positive(),
 });
 
 const RecallHitSchema = z.object({
@@ -68,6 +96,66 @@ const MemoryQueryInputSchema = z.object({
 const MemoryQueryOutputSchema = z.object({
   results: z.array(RecallHitSchema),
   count: z.number().int().nonnegative(),
+});
+
+const MemorySearchIncludesSchema = z
+  .object({
+    matches: z.boolean().default(false),
+    edges: z.boolean().default(false),
+    explanations: z.boolean().default(false),
+    debug: z.boolean().default(false),
+  })
+  .strict()
+  .default({});
+
+const MemorySearchInputSchema = z
+  .object({
+    query: z.string().default(""),
+    limit: ToolLimitSchema.optional(),
+    minScore: RecallFiltersSchema.shape.minScore.optional(),
+    scopes: RecallFiltersSchema.shape.scopes.optional(),
+    types: RecallFiltersSchema.shape.types.optional(),
+    includeSuperseded: RecallFiltersSchema.shape.includeSuperseded.optional(),
+    mode: RecallFiltersSchema.shape.mode.optional(),
+    includes: MemorySearchIncludesSchema.optional(),
+  })
+  .strict();
+
+const MemorySearchMatchSchema = z.object({
+  memoryId: z.string(),
+  score: z.number(),
+  source: z.enum(["lex", "vec", "hybrid"]),
+  snippet: z.string(),
+});
+
+const MemorySearchExplanationSchema = z.object({
+  memoryId: z.string(),
+  text: z.string(),
+});
+
+const MemorySearchEdgeSchema = z.object({
+  memoryId: z.string(),
+  direction: z.enum(["outbound", "inbound"]),
+  depth: z.number().int().positive(),
+  edge: MemoryEdgeSchema,
+  neighbor: MemoryItemSchema,
+});
+
+const MemorySearchDebugSchema = z.object({
+  query: z.string(),
+  mode: RecallFiltersSchema.shape.mode,
+  includes: MemorySearchIncludesSchema,
+  resultIds: z.array(z.string()),
+  matchCount: z.number().int().nonnegative(),
+});
+
+const MemorySearchOutputSchema = z.object({
+  items: z.array(MemoryItemSchema),
+  count: z.number().int().nonnegative(),
+  matches: z.array(MemorySearchMatchSchema).optional(),
+  edges: z.array(MemorySearchEdgeSchema).optional(),
+  explanations: z.array(MemorySearchExplanationSchema).optional(),
+  debug: MemorySearchDebugSchema.optional(),
 });
 
 const MemoryGetInputSchema = z.object({
@@ -114,6 +202,32 @@ const MemoryStatusOutputSchema = z.object({
   totalVectors: z.number().int().nonnegative(),
   pendingEmbeddings: z.number().int().nonnegative(),
   lastIndexedAt: z.string().nullable(),
+});
+
+const MemoryLinkInputSchema = CreateEdgeInputSchema;
+
+const MemoryLinkOutputSchema = z.object({
+  edge: MemoryEdgeSchema,
+  action: z.enum(["created", "updated", "unchanged"]),
+});
+
+const MemoryNeighborsInputSchema = z
+  .object({
+    id: z.string().min(1),
+  })
+  .merge(ListNeighborsInputSchema);
+
+const MemoryNeighborsOutputSchema = z.object({
+  id: z.string(),
+  depth: z.number().int().positive(),
+  neighbors: z.array(MemoryNeighborSchema),
+  count: z.number().int().nonnegative(),
+});
+
+const MemoryEdgeUpdateInputSchema = UpdateEdgeInputSchema;
+
+const MemoryEdgeUpdateOutputSchema = z.object({
+  edge: MemoryEdgeSchema,
 });
 
 const MemoryReindexOutputSchema = z.object({
@@ -184,6 +298,29 @@ function createToolResult<T>(schema: z.ZodType<T>, payload: T) {
   return {
     content: [{ type: "text" as const, text: JSON.stringify(parsed) }],
     structuredContent: parsed as Record<string, unknown>,
+  };
+}
+
+function normalizeEdgeAcceptedBy(input: z.output<typeof CreateEdgeInputSchema>): z.output<typeof CreateEdgeInputSchema> {
+  const nextStatus = input.status ?? (input.origin === "manual" ? "accepted" : "suggested");
+  if (nextStatus !== "accepted") {
+    return { ...input, acceptedBy: null };
+  }
+
+  return {
+    ...input,
+    acceptedBy: input.acceptedBy ?? "agent",
+  };
+}
+
+function normalizeEdgeUpdateAcceptedBy(input: z.output<typeof UpdateEdgeInputSchema>): z.output<typeof UpdateEdgeInputSchema> {
+  if (input.status !== "accepted") {
+    return input;
+  }
+
+  return {
+    ...input,
+    acceptedBy: input.acceptedBy ?? "agent",
   };
 }
 
@@ -299,18 +436,19 @@ export async function startMcpServer(options: StartMcpServerOptions = {}): Promi
     logger.info("Loading configuration");
     const config = loadAppConfig(options.configPath, { silent: true });
     const workspace = resolveWorkspace(config, options.workspace);
+    const storage = resolveStoragePaths(config, workspace);
     logger.info(`Using workspace: ${workspace}`);
 
-    mkdirSync(dirname(config.storage.dbPath), { recursive: true });
-    mkdirSync(config.storage.zvecPath, { recursive: true });
+    mkdirSync(dirname(storage.dbPath), { recursive: true });
+    mkdirSync(storage.zvecPath, { recursive: true });
     logger.info("Ensured storage directories exist");
 
-    resources.db = openDatabase(config.storage.dbPath);
+    resources.db = openDatabase(storage.dbPath);
     runMigrations(resources.db);
     logger.info("Database opened and migrations applied");
 
     resources.vectorStore = await initializeVectorStore({
-      zvecPath: config.storage.zvecPath,
+      zvecPath: storage.zvecPath,
     });
     logger.info("Vector store initialized");
 
@@ -325,6 +463,9 @@ export async function startMcpServer(options: StartMcpServerOptions = {}): Promi
       dimensions: config.ai.embedding.dimensions,
       batchSize: config.ai.embedding.batchSize,
       maxTokens: config.ai.embedding.maxTokens,
+      baseUrl: config.ai.embedding.baseUrl,
+      apiKey: config.ai.embedding.apiKey,
+      taskType: config.ai.embedding.taskType,
     });
 
     try {
@@ -372,6 +513,92 @@ export async function startMcpServer(options: StartMcpServerOptions = {}): Promi
             results,
             count: results.length,
           };
+        })
+    );
+
+    resources.server.registerTool(
+      "memory_search",
+      {
+        title: "Memory Search",
+        description: "Search memory items with optional evidence fields.",
+        inputSchema: MemorySearchInputSchema,
+        outputSchema: MemorySearchOutputSchema,
+      },
+      async (input) =>
+        executeTool(MemorySearchOutputSchema, async () => {
+          const includes = MemorySearchIncludesSchema.parse(input.includes ?? {});
+          const query = input.query ?? "";
+          const mode = input.mode ?? "hybrid";
+          logger.info(`memory_search called (${summarizeForLog("query", query)})`);
+
+          const hits = await recall(ctx, query, {
+            topK: input.limit,
+            minScore: input.minScore,
+            scopes: input.scopes,
+            types: input.types,
+            includeSuperseded: input.includeSuperseded,
+            mode,
+          });
+
+          const items = (
+            await Promise.all(hits.map(async (hit) => get(ctx, hit.id)))
+          ).filter((item): item is z.infer<typeof MemoryItemSchema> => item !== null);
+          const payload: z.infer<typeof MemorySearchOutputSchema> = {
+            items,
+            count: items.length,
+          };
+
+          if (includes.matches) {
+            payload.matches = hits.map((hit) => ({
+              memoryId: hit.id,
+              score: hit.score,
+              source: hit.source,
+              snippet: hit.snippet,
+            }));
+          }
+
+          if (includes.explanations) {
+            payload.explanations = hits
+              .filter((hit) => typeof hit.explanation === "string" && hit.explanation.length > 0)
+              .map((hit) => ({
+                memoryId: hit.id,
+                text: hit.explanation as string,
+              }));
+          }
+
+          if (includes.edges) {
+            const edgeGroups = await Promise.all(
+              items.map(async (item) => ({
+                memoryId: item.id,
+                neighbors: await listNeighbors(ctx, item.id, {
+                  depth: 1,
+                  statuses: ["accepted", "suggested"],
+                  limit: 20,
+                }),
+              }))
+            );
+            payload.edges = edgeGroups.flatMap((group) =>
+              group.neighbors.map((neighbor) => ({
+                memoryId: group.memoryId,
+                direction: neighbor.direction,
+                depth: neighbor.depth,
+                edge: neighbor.edge,
+                neighbor: neighbor.memory,
+              }))
+            );
+          }
+
+          if (includes.debug) {
+            payload.debug = {
+              query,
+              mode,
+              includes,
+              resultIds: items.map((item) => item.id),
+              matchCount: hits.length,
+            };
+          }
+
+          return payload;
         })
     );
 
@@ -457,6 +684,108 @@ export async function startMcpServer(options: StartMcpServerOptions = {}): Promi
         executeTool(MemoryStatusOutputSchema, async () => {
           logger.info("memory_status called");
           return status(ctx);
+        })
+    );
+
+    resources.server.registerTool(
+      "memory_link",
+      {
+        title: "Memory Link",
+        description: "Create or update an explicit graph edge.",
+        inputSchema: MemoryLinkInputSchema,
+        outputSchema: MemoryLinkOutputSchema,
+      },
+      async (input) =>
+        executeTool(MemoryLinkOutputSchema, async () => {
+          logger.info(`memory_link called (from=${input.fromMemoryId}, to=${input.toMemoryId})`);
+          const normalizedInput = normalizeEdgeAcceptedBy(MemoryLinkInputSchema.parse(input));
+          const existingEdgeId = (
+            ctx.db.db
+              .prepare(
+                `
+                  SELECT e.id
+                  FROM memory_edges e
+                  INNER JOIN memory_items src ON src.id = e.from_memory_id
+                  INNER JOIN memory_items dst ON dst.id = e.to_memory_id
+                  WHERE e.from_memory_id = ?
+                    AND e.to_memory_id = ?
+                    AND e.relation_type = ?
+                    AND src.workspace = ?
+                    AND dst.workspace = ?
+                `
+              )
+              .get(
+                normalizedInput.fromMemoryId,
+                normalizedInput.toMemoryId,
+                normalizedInput.relationType,
+                ctx.workspace,
+                ctx.workspace
+              ) as { id: string } | undefined
+          )?.id;
+          const initialEdge = await createEdge(ctx, normalizedInput);
+
+          let action: z.infer<typeof MemoryLinkOutputSchema>["action"] = existingEdgeId ? "unchanged" : "created";
+          let edge = initialEdge;
+          const requiresUpdate =
+            edge.confidence !== normalizedInput.confidence ||
+            edge.origin !== normalizedInput.origin ||
+            edge.status !== (normalizedInput.status ?? edge.status) ||
+            edge.justification !== normalizedInput.justification ||
+            edge.acceptedBy !== (normalizedInput.acceptedBy ?? edge.acceptedBy);
+
+          if (requiresUpdate) {
+            action = "updated";
+            edge = await updateEdge(ctx, {
+              id: edge.id,
+              confidence: normalizedInput.confidence,
+              origin: normalizedInput.origin,
+              status: normalizedInput.status,
+              justification: normalizedInput.justification,
+              acceptedBy: normalizedInput.acceptedBy,
+            });
+          } else if (edge.createdAt !== edge.updatedAt) {
+            action = "unchanged";
+          }
+
+          return { edge, action };
+        })
+    );
+
+    resources.server.registerTool(
+      "memory_neighbors",
+      {
+        title: "Memory Neighbors",
+        description: "Inspect the graph neighborhood around a memory item.",
+        inputSchema: MemoryNeighborsInputSchema,
+        outputSchema: MemoryNeighborsOutputSchema,
+      },
+      async (input) =>
+        executeTool(MemoryNeighborsOutputSchema, async () => {
+          logger.info(`memory_neighbors called (id=${input.id})`);
+          const { id, ...filters } = input;
+          const neighbors = await listNeighbors(ctx, id, filters);
+          return {
+            id,
+            depth: filters.depth ?? 1,
+            neighbors,
+            count: neighbors.length,
+          };
+        })
+    );
+
+    resources.server.registerTool(
+      "memory_edge_update",
+      {
+        title: "Memory Edge Update",
+        description: "Update edge status or metadata explicitly.",
+        inputSchema: MemoryEdgeUpdateInputSchema,
+        outputSchema: MemoryEdgeUpdateOutputSchema,
+      },
+      async (input) =>
+        executeTool(MemoryEdgeUpdateOutputSchema, async () => {
+          logger.info(`memory_edge_update called (id=${input.id})`);
+          const edge = await updateEdge(ctx, normalizeEdgeUpdateAcceptedBy(MemoryEdgeUpdateInputSchema.parse(input)));
+          return { edge };
         })
     );
 

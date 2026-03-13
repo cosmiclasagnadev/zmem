@@ -2,6 +2,16 @@ import type { DbHandle } from "../db/index.js";
 import type { EmbeddingProvider } from "../embed/types.js";
 import type { VectorCollection } from "../vectors/index.js";
 import type { AppConfig } from "../config/schema.js";
+import type { CreateEdgeInput, SaveMemoryData } from "./types.js";
+
+export interface EdgeSuggestionProvider {
+  suggestForSave(args: {
+    ctx: CoreContext;
+    memoryId: string;
+    workspace: string;
+    input: SaveMemoryData;
+  }): Promise<CreateEdgeInput[]>;
+}
 
 /**
  * CoreContext holds all dependencies needed by core operations.
@@ -22,6 +32,9 @@ export interface CoreContext {
   
   /** Application configuration */
   config: AppConfig;
+
+  /** Optional save-time edge suggestion provider */
+  edgeSuggestionProvider?: EdgeSuggestionProvider;
 }
 
 /**
@@ -33,6 +46,7 @@ export interface CreateCoreContextOptions {
   vectorCollection: VectorCollection;
   workspace: string;
   config: AppConfig;
+  edgeSuggestionProvider?: EdgeSuggestionProvider;
 }
 
 /**
@@ -45,5 +59,6 @@ export function createCoreContext(options: CreateCoreContextOptions): CoreContex
     vectorCollection: options.vectorCollection,
     workspace: options.workspace,
     config: options.config,
+    edgeSuggestionProvider: options.edgeSuggestionProvider,
   };
 }

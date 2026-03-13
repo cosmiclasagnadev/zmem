@@ -34,7 +34,6 @@
     }
   ],
   "storage": {
-    "dbPath": "./data/memory.db",
-    "zvecPath": "./data/vectors"
+    "baseDir": "/absolute/path/to/zmem-storage"
   }
 }

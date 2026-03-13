@@ -35,7 +35,7 @@ References:
 - **Language/runtime:** TypeScript + Node.js
 - **Vectors:** `@zvec/zvec`
 - **Lexical:** `better-sqlite3` + FTS5/BM25
-- **Embeddings:** `node-llama-cpp` (default model: Qwen3-Embedding-0.6B GGUF)
+- **Embeddings:** `node-llama-cpp` by default, with explicit provider hooks for Gemini and offline mock testing
 - **Validation:** `zod`
 - **Agent integration:** `@modelcontextprotocol/sdk`
 
@@ -108,8 +108,23 @@ Then update:
 - `workspaces[].root` to a real absolute path
 - any desired `patterns` for ingestion
 - storage paths (`storage.dbPath`, `storage.zvecPath`) if needed
+- `ai.embedding.provider` if you want to switch from local `llamacpp` to `gemini`
+- `ai.embedding.apiKey` / `ZMD_EMBED_API_KEY` when using `gemini`
+- `storage.baseDir` only if you want to override the default XDG-style storage root
 
 If `config.json` is missing, `zmem` falls back to defaults.
+
+Default storage is outside your repo:
+
+- macOS/Linux: `~/.local/share/zmem/workspaces/<workspace-slug>/`
+- Windows: `%APPDATA%/zmem/workspaces/<workspace-slug>/`
+
+Within each workspace directory, zmem stores:
+
+- `memory.db`
+- `vectors/`
+
+Advanced overrides still work through `storage.baseDir`, `storage.dbPath`, `storage.zvecPath`, `ZMEM_STORAGE_BASE_DIR`, `ZMEM_DB_PATH`, and `ZMEM_ZVEC_PATH`.
 
 ### 3) Ingest documents
 
@@ -201,7 +216,14 @@ npm run smoke
 ## Environment variables
 
 - `ZMD_EMBED_MODEL` - override embedding model
-- `ZMD_EMBED_PROVIDER` - override embedding provider (`llamacpp`, `openai`, `ollama`)
+- `ZMD_EMBED_DIMENSIONS` - override embedding dimensions
+- `ZMD_EMBED_PROVIDER` - override embedding provider (`llamacpp`, `openai`, `ollama`, `gemini`, `mock`)
+- `ZMD_EMBED_API_KEY` - embedding API key override for remote providers such as Gemini
+- `ZMD_EMBED_BASE_URL` - optional embedding API base URL override
+- `ZMD_EMBED_TASK_TYPE` - optional Gemini task type override such as `RETRIEVAL_DOCUMENT`
+- `ZMEM_STORAGE_BASE_DIR` - override the XDG-style storage root
+- `ZMEM_DB_PATH` - override the resolved database path directly
+- `ZMEM_ZVEC_PATH` - override the resolved vector storage path directly
 - `ZMEM_WORKSPACE` - default workspace for MCP resolution
 - `ZMEM_MCP_VERBOSE=true` - verbose MCP logs to stderr
 - `ZMEM_ENABLE_REINDEX_TOOL=true` - expose `memory_reindex` MCP tool

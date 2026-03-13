@@ -1,3 +1,5 @@
+export type EmbeddingProviderName = "llamacpp" | "openai" | "ollama" | "gemini" | "mock";
+
 export interface EmbedRequest {
   id: string;
   text: string;
@@ -40,11 +42,12 @@ export interface EmbeddingProvider {
 }
 
 export interface EmbeddingProviderConfig {
-  provider: string;
+  provider: EmbeddingProviderName;
   model: string;
   dimensions: number;
   batchSize: number;
   maxTokens: number;
   baseUrl?: string;
   apiKey?: string;
+  taskType?: string;
 }

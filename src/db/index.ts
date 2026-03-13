@@ -1,5 +1,7 @@
 import Database from "better-sqlite3";
 
+export { persistMemoryEdge, type PersistMemoryEdgeInput } from "./edges.js";
+
 export interface DbHandle {
   db: Database.Database;
 }

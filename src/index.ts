@@ -12,6 +12,7 @@ import {
 } from "./ingest/index.js";
 import { createCoreContext, recall } from "./core/index.js";
 import { startMcpServer } from "./mcp/index.js";
+import { resolveStoragePaths } from "./storage/paths.js";
 import type { MemoryType } from "./types/memory.js";
 import { initLogger } from "./utils/logger.js";
 import { mkdirSync, existsSync } from "node:fs";
@@ -78,15 +79,16 @@ async function handleIngest(args: string[]): Promise<void> {
 
   const config = loadAppConfig();
   const workspaceName = workspaceArg || "default";
+  const storage = resolveStoragePaths(config, workspaceName);
 
-  mkdirSync(dirname(config.storage.dbPath), { recursive: true });
-  mkdirSync(config.storage.zvecPath, { recursive: true });
+  mkdirSync(dirname(storage.dbPath), { recursive: true });
+  mkdirSync(storage.zvecPath, { recursive: true });
 
-  const db = openDatabase(config.storage.dbPath);
+  const db = openDatabase(storage.dbPath);
   runMigrations(db);
 
   const vectorStore = await initializeVectorStore({
-    zvecPath: config.storage.zvecPath,
+    zvecPath: storage.zvecPath,
   });
 
   const embedProvider = createEmbeddingProvider({
@@ -95,6 +97,9 @@ async function handleIngest(args: string[]): Promise<void> {
     dimensions: config.ai.embedding.dimensions,
     batchSize: config.ai.embedding.batchSize,
     maxTokens: config.ai.embedding.maxTokens,
+    baseUrl: config.ai.embedding.baseUrl,
+    apiKey: config.ai.embedding.apiKey,
+    taskType: config.ai.embedding.taskType,
   });
   await embedProvider.initialize();
 
@@ -132,19 +137,21 @@ async function handleStatus(args: string[]): Promise<void> {
   console.log("📊 zmem - Status\n");
 
   const config = loadAppConfig();
+  const storage = resolveStoragePaths(config, workspaceName);
 
-  if (!existsSync(config.storage.dbPath)) {
+  if (!existsSync(storage.dbPath)) {
     console.log("No database found. Run 'zmem ingest <path>' first.");
     return;
   }
 
-  const db = openDatabase(config.storage.dbPath);
+  const db = openDatabase(storage.dbPath);
 
   try {
     const stats = getIngestStats(db, workspaceName);
 
     console.log(`Workspace: ${workspaceName}`);
-    console.log(`Database: ${config.storage.dbPath}`);
+    console.log(`Database: ${storage.dbPath}`);
+    console.log(`Vectors: ${storage.zvecPath}`);
     console.log("");
     console.log(`Total documents: ${stats.total}`);
     console.log(`  Active: ${stats.active}`);
@@ -163,31 +170,32 @@ async function handleQuery(args: string[]): Promise<void> {
   const scopesArg = args.find((a) => a.startsWith("--scopes="))?.split("=")[1];
   const typesArg = args.find((a) => a.startsWith("--types="))?.split("=")[1];
 
-  if (!queryArg) {
-    console.error("Usage: zmem query <query> [--workspace=<name>] [--mode=hybrid|lexical|vector] [--scopes=scope1,scope2] [--types=type1,type2]");
+  if (queryArg === undefined) {
+    console.error("Usage: zmem query <query> [--workspace=<name>] [--mode=hybrid|lexical|vector|recent|important|typed] [--scopes=scope1,scope2] [--types=type1,type2]");
     process.exit(1);
   }
 
-  const validModes = ["hybrid", "lexical", "vector"] as const;
+  const validModes = ["hybrid", "lexical", "vector", "recent", "important", "typed"] as const;
   if (rawMode && !validModes.includes(rawMode as typeof validModes[number])) {
     console.error(`Invalid mode: "${rawMode}". Must be one of: ${validModes.join(", ")}`);
     process.exit(1);
   }
-  const modeArg = rawMode as "hybrid" | "lexical" | "vector" | undefined;
+  const modeArg = rawMode as typeof validModes[number] | undefined;
 
   console.log("🔍 zmem - Query\n");
 
   const config = loadAppConfig();
   const workspaceName = workspaceArg || "default";
+  const storage = resolveStoragePaths(config, workspaceName);
 
-  if (!existsSync(config.storage.dbPath)) {
+  if (!existsSync(storage.dbPath)) {
     console.log("No database found. Run 'zmem ingest <path>' first.");
     return;
   }
 
-  const db = openDatabase(config.storage.dbPath);
+  const db = openDatabase(storage.dbPath);
   const vectorStore = await initializeVectorStore({
-    zvecPath: config.storage.zvecPath,
+    zvecPath: storage.zvecPath,
   });
 
   const embedProvider = createEmbeddingProvider({
@@ -196,6 +204,9 @@ async function handleQuery(args: string[]): Promise<void> {
     dimensions: config.ai.embedding.dimensions,
     batchSize: config.ai.embedding.batchSize,
     maxTokens: config.ai.embedding.maxTokens,
+    baseUrl: config.ai.embedding.baseUrl,
+    apiKey: config.ai.embedding.apiKey,
+    taskType: config.ai.embedding.taskType,
   });
 
   let collection: import("./vectors/index.js").VectorCollection | null = null;
@@ -306,7 +317,7 @@ Usage:
 Commands:
   ingest <path> [--workspace=<name>] [--logs=true|false]   Ingest markdown files from path
   status [--workspace=<name>] [--logs=true|false]         Show ingestion status
-  query <query> [--workspace=<name>] [--mode=hybrid|lexical|vector] [--logs=true|false]
+  query <query> [--workspace=<name>] [--mode=hybrid|lexical|vector|recent|important|typed] [--logs=true|false]
                                        Search memories
   mcp [--config=./config.json] [--workspace=<name>] [--verbose=true|false]
                                        Start MCP stdio server
@@ -318,6 +329,7 @@ Examples:
   zmem status --workspace=default
   zmem query "sqlite database"
   zmem query "database decisions" --mode=hybrid
+  zmem query "" --mode=recent --workspace=default
   zmem query "dark mode" --types=preference
   zmem query "sqlite" --logs=true
   zmem mcp --workspace=default

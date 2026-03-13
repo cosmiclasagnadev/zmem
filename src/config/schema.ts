@@ -17,14 +17,15 @@ const workspaceSchema = z.object({
 });
 
 const embeddingConfigSchema = z.object({
-  provider: z.enum(["llamacpp", "openai", "ollama"]).default("llamacpp"),
+  provider: z.enum(["llamacpp", "openai", "ollama", "gemini", "mock"]).default("llamacpp"),
   model: z.string().default("hf:Qwen/Qwen3-Embedding-0.6B-GGUF/Qwen3-Embedding-0.6B-Q8_0.gguf"),
   dimensions: z.number().int().positive().default(1024),
   quantization: z.enum(["Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0", "F16"]).default("Q8_0"),
   batchSize: z.number().int().positive().default(8),
   maxTokens: z.number().int().positive().default(8192),
-  baseUrl: z.string().optional(), // For ollama/openai providers
-  apiKey: z.string().optional() // For openai provider
+  baseUrl: z.string().optional(),
+  apiKey: z.string().optional(),
+  taskType: z.string().optional()
 });
 
 const rerankConfigSchema = z.object({
@@ -49,8 +50,9 @@ export const appConfigSchema = z.object({
   }),
   workspaces: z.array(workspaceSchema).default([]),
   storage: z.object({
-    dbPath: z.string().default("./data/memory.db"),
-    zvecPath: z.string().default("./data/vectors")
+    baseDir: z.string().optional(),
+    dbPath: z.string().optional(),
+    zvecPath: z.string().optional()
   }).default({})
 });
 

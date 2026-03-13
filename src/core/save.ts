@@ -1,8 +1,10 @@
 import type { CoreContext } from "./context.js";
 import type { MemoryScope, MemoryType } from "../types/memory.js";
-import type { SaveMemoryInput, SaveResult } from "./types.js";
+import type { CreateEdgeInput, SaveMemoryInput, SaveResult } from "./types.js";
 import { SaveMemoryInputSchema, CoreError } from "./types.js";
 import { generateMemoryId, getMemoryItemStatus } from "./utils.js";
+import { createEdgeRecord } from "./edges.js";
+import { persistSuggestedEdgeRecord } from "./edge-suggestions.js";
 import { chunkDocument } from "../ingest/chunker.js";
 import { createHash } from "node:crypto";
 import { deleteVectorsForMemory } from "./vector-sync.js";
@@ -148,8 +150,37 @@ export async function save(
       );
     }
 
+    const suggestedEdges = data.suggestEdges
+      ? normalizeSaveEdgeSuggestions(
+          id,
+          (await ctx.edgeSuggestionProvider?.suggestForSave({
+            ctx,
+            memoryId: id,
+            workspace: ctx.workspace,
+            input: data,
+          })) ?? []
+        )
+      : [];
+
     const finalizeNow = new Date().toISOString();
     const finalizeTx = ctx.db.db.transaction(() => {
+      for (const link of data.links) {
+        createEdgeRecord(ctx, {
+          fromMemoryId: id,
+          toMemoryId: link.toMemoryId,
+          relationType: link.relationType,
+          confidence: link.confidence,
+          origin: "manual",
+          status: "accepted",
+          justification: link.justification,
+          acceptedBy: link.acceptedBy,
+        });
+      }
+
+      for (const suggestion of suggestedEdges) {
+        persistSuggestedEdgeRecord(ctx, suggestion);
+      }
+
       updateMemoryStatus.run("active", finalizeNow, id, ctx.workspace);
       if (supersededId) {
         updateMemoryStatus.run("archived", finalizeNow, supersededId, ctx.workspace);
@@ -203,6 +234,16 @@ export async function save(
       error instanceof Error ? error : undefined
     );
   }
+}
+
+function normalizeSaveEdgeSuggestions(memoryId: string, suggestions: CreateEdgeInput[]): CreateEdgeInput[] {
+  return suggestions.map((suggestion) => ({
+    ...suggestion,
+    fromMemoryId: memoryId,
+    status: suggestion.status ?? "suggested",
+    origin: suggestion.origin ?? "llm",
+    acceptedBy: suggestion.acceptedBy ?? null,
+  }));
 }
 
 /**

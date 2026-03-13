@@ -1,5 +1,6 @@
 import type { EmbeddingProvider, EmbedRequest, EmbedResult, EmbeddingProviderConfig } from "./types.js";
 import { debug, info } from "../utils/logger.js";
+import { createDeterministicEmbedding } from "./deterministic.js";
 
 /**
  * LlamaCpp embedding provider using node-llama-cpp
@@ -62,23 +63,7 @@ export class LlamaCppEmbeddingProvider implements EmbeddingProvider {
     // For now, return a random vector as a placeholder
     debug(() => `[LlamaCppProvider] Embedding text (${text.length} chars)`);
     
-    // Generate deterministic pseudo-random embedding based on text hash
-    const embedding: number[] = [];
-    let seed = 0;
-    for (let i = 0; i < text.length; i++) {
-      seed = (seed << 5) - seed + text.charCodeAt(i);
-      seed = seed & seed;
-    }
-    
-    for (let i = 0; i < this.dimensions; i++) {
-      // Simple LCG for deterministic pseudo-random numbers
-      seed = (seed * 1103515245 + 12345) & 0x7fffffff;
-      embedding.push((seed / 0x7fffffff) * 2 - 1);
-    }
-    
-    // Normalize to unit length
-    const magnitude = Math.sqrt(embedding.reduce((sum, val) => sum + val * val, 0));
-    return embedding.map(val => val / magnitude);
+    return createDeterministicEmbedding(text, this.dimensions, this.model);
   }
 
   async embedBatch(requests: EmbedRequest[]): Promise<EmbedResult[]> {
