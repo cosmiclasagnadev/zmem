@@ -179,6 +179,54 @@ test("candidate pool includes both recent and semantic candidates", async () => 
   }
 });
 
+test("candidate pool preserves zero semantic scores when merging candidates", async () => {
+  const { ctx, handle, cleanup } = createTestCoreContext({
+    vectorHits: [
+      {
+        id: "mem_zero_semantic_0",
+        distance: 1,
+        score: 0,
+        fields: { scope: "workspace", type: "fact" },
+      },
+    ],
+  });
+
+  try {
+    seedMemories(handle, [
+      { id: "mem_zero_semantic", title: "Zero semantic", content: "Still a valid candidate", createdAt: "2026-03-12T00:00:02.000Z" },
+      { id: "mem_recent_only", title: "Recent only", content: "Recent candidate", createdAt: "2026-03-12T00:00:03.000Z" },
+    ]);
+
+    const pool = await buildSaveEdgeSuggestionCandidatePool(ctx, {
+      memoryId: "mem_new",
+      workspace: ctx.workspace,
+      input: {
+        type: "fact",
+        title: "New memory",
+        content: "This should merge semantic and recent candidates without erasing zero scores.",
+        summary: "",
+        source: "test",
+        scope: "workspace",
+        tags: [],
+        importance: 0.5,
+        links: [],
+        suggestEdges: true,
+      },
+    }, {
+      semanticCandidateLimit: 2,
+      recentCandidateLimit: 2,
+    });
+
+    const merged = pool.allCandidates.find((candidate) => candidate.memoryId === "mem_zero_semantic");
+    assert(merged, "Expected merged candidate to exist");
+    assert.equal(merged?.semanticScore, 0);
+    assert(merged?.sources.includes("semantic"));
+    assert(merged?.sources.includes("recent"));
+  } finally {
+    cleanup();
+  }
+});
+
 test("only the top few suggestions are persisted", async () => {
   const generator: EdgeSuggestionGenerator = {
     async suggest({ candidatePool }) {

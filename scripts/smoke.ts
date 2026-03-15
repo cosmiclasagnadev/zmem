@@ -188,9 +188,15 @@ class Harness {
     assert(this.db, "DB not initialized");
 
     const openCollection = this.collections.get(workspace);
-    const vectorIds = this.db.db
+    const memoryRows = this.db.db
       .prepare(`SELECT id FROM memory_items WHERE workspace = ?`)
       .all(workspace) as Array<{ id: string }>;
+    const memoryIds = memoryRows.map((row) => row.id);
+    const vectorIds = memoryIds.length === 0
+      ? []
+      : (this.db.db
+          .prepare(`SELECT id FROM content_chunks WHERE memory_id IN (${memoryIds.map(() => "?").join(", ")})`)
+          .all(...memoryIds) as Array<{ id: string }>);
 
     const collection =
       openCollection ??

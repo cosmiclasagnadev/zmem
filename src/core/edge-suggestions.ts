@@ -336,7 +336,10 @@ function mergeCandidates(...lists: EdgeSuggestionCandidate[][]): EdgeSuggestionC
       merged.set(candidate.memoryId, {
         ...existing,
         sources: sortSources([...existing.sources, ...candidate.sources]),
-        semanticScore: Math.max(existing.semanticScore ?? 0, candidate.semanticScore ?? 0) || null,
+        semanticScore:
+          existing.semanticScore === null && candidate.semanticScore === null
+            ? null
+            : Math.max(existing.semanticScore ?? 0, candidate.semanticScore ?? 0),
         recencyRank: pickLower(existing.recencyRank, candidate.recencyRank),
       });
     }
