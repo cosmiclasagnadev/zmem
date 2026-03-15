@@ -3,6 +3,7 @@ import type { EmbeddingProvider } from "../embed/types.js";
 import type { VectorCollection } from "../vectors/index.js";
 import type { AppConfig } from "../config/schema.js";
 import type { CreateEdgeInput, SaveMemoryData } from "./types.js";
+import type { QueryExpander } from "../search/query-expansion.js";
 
 export interface EdgeSuggestionProvider {
   suggestForSave(args: {
@@ -35,6 +36,9 @@ export interface CoreContext {
 
   /** Optional save-time edge suggestion provider */
   edgeSuggestionProvider?: EdgeSuggestionProvider;
+
+  /** Optional query expansion provider */
+  queryExpander?: QueryExpander;
 }
 
 /**
@@ -47,6 +51,7 @@ export interface CreateCoreContextOptions {
   workspace: string;
   config: AppConfig;
   edgeSuggestionProvider?: EdgeSuggestionProvider;
+  queryExpander?: QueryExpander;
 }
 
 /**
@@ -60,5 +65,6 @@ export function createCoreContext(options: CreateCoreContextOptions): CoreContex
     workspace: options.workspace,
     config: options.config,
     edgeSuggestionProvider: options.edgeSuggestionProvider,
+    queryExpander: options.queryExpander,
   };
 }

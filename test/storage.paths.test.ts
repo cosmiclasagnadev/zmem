@@ -1,5 +1,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
 import { loadAppConfig } from "../src/config/loadConfig.js";
 import { resolveStoragePaths } from "../src/storage/paths.js";
 
@@ -57,6 +60,46 @@ test("resolveStoragePaths prefers explicit env and config overrides", () => {
     restoreEnv("ZMEM_STORAGE_BASE_DIR", originalBase);
     restoreEnv("ZMEM_DB_PATH", originalDb);
     restoreEnv("ZMEM_ZVEC_PATH", originalZvec);
+  }
+});
+
+test("loadAppConfig applies env overrides after config file values", () => {
+  const originalProvider = process.env.ZMD_EMBED_PROVIDER;
+  const originalBaseDir = process.env.ZMEM_STORAGE_BASE_DIR;
+  const dir = mkdtempSync(join(tmpdir(), "zmem-config-merge-"));
+  const configPath = join(dir, "config.json");
+
+  try {
+    writeFileSync(
+      configPath,
+      JSON.stringify({
+        defaults: { retrieval: {} },
+        ai: {
+          embedding: {
+            provider: "mock",
+            model: "config-model",
+            dimensions: 3,
+            batchSize: 2,
+            maxTokens: 512,
+          },
+          rerank: {},
+        },
+        storage: {
+          baseDir: "/tmp/config-storage-base",
+        },
+      })
+    );
+
+    process.env.ZMD_EMBED_PROVIDER = "gemini";
+    process.env.ZMEM_STORAGE_BASE_DIR = "/tmp/env-storage-base";
+
+    const config = loadAppConfig(configPath, { silent: true });
+    assert.equal(config.ai.embedding.provider, "gemini");
+    assert.equal(config.storage.baseDir, "/tmp/env-storage-base");
+  } finally {
+    restoreEnv("ZMD_EMBED_PROVIDER", originalProvider);
+    restoreEnv("ZMEM_STORAGE_BASE_DIR", originalBaseDir);
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

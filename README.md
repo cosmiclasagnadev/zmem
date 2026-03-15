@@ -12,11 +12,96 @@ Local-first hybrid memory for engineering workflows.
 
 overall it is a local-first, agent-oriented memory substrate for engineering decisions and evolving project context
 
-Install from npm (global CLI):
+## Quickstart
+
+Get `zmem` running locally in a few minutes.
+
+### 1. Install
 
 ```bash
 npm install -g @cosmiclasagnadev/zmem
 zmem help
+```
+
+Or from this repo:
+
+```bash
+npm install
+npm run build
+npm install -g .
+```
+
+### 2. Initialize a workspace
+
+Create or update a starter config for the workspace you want to index:
+
+```bash
+zmem init --workspace=default --root=/absolute/path/to/your/project --yes
+```
+
+This creates a config and sets up zmem to use user-scoped storage by default.
+
+### 3. Check setup
+
+Validate config, storage, and local model settings:
+
+```bash
+zmem doctor --workspace=default
+zmem models status
+```
+
+### 4. Prepare local query-expansion models
+
+zmem uses local-first query expansion by default.
+
+See the exact model pull commands:
+
+```bash
+zmem models pull
+```
+
+This will print commands for the default local models:
+
+- primary: `hf:mradermacher/qmd-query-expansion-qwen3.5-2B-GGUF:Q4_K_M`
+- fallback: `hf:mradermacher/qmd-query-expansion-qwen3.5-2B-GGUF:Q4_K_S`
+
+Run the printed `node-llama-cpp pull` commands, or let zmem download on first query.
+
+### 5. Ingest your docs
+
+```bash
+zmem ingest /absolute/path/to/your/project --workspace=default
+```
+
+### 6. Query your memory
+
+```bash
+zmem query "database migration" --workspace=default
+zmem query "" --mode=recent --workspace=default
+zmem query "" --mode=typed --types=decision,preference --workspace=default
+```
+
+### 7. Use with MCP / OpenCode
+
+Start the MCP server:
+
+```bash
+zmem mcp --workspace=default
+```
+
+Then point your MCP client, such as OpenCode, at the `zmem` command.
+
+### First-run notes
+
+- Default storage is outside your repo:
+  - macOS/Linux: `~/.local/share/zmem/workspaces/<workspace-slug>/`
+  - Windows: `%APPDATA%/zmem/workspaces/<workspace-slug>/`
+- Query expansion is enabled by default for hybrid retrieval.
+- If the local query-expansion model is unavailable, zmem warns once and falls back to deterministic expansion.
+- You can inspect the fully resolved config with:
+
+```bash
+zmem config show --workspace=default
 ```
 
 References:
@@ -27,7 +112,7 @@ References:
 - explicit memory types and lifecycle (pending, active, archived, deleted) plus supersedes_id
   - if no explicit type is defined, it defaults to 'fact'
   - if no explicit tags are defined, it defaults to '[]' 
-- **no concrete query expansion step yet** since graph traversal is part of pipeline and I'm not sure how to effectively do query expansion once graph comes in to play
+- bounded query expansion is available through deterministic variants today, with room for LLM-backed expansion later
 - uses `@zvec/zvec` for dense retrieval when doing vector search
 
 ## Architecture (high level)
@@ -44,7 +129,8 @@ Hybrid retrieval flow (follows qmd's style closely):
 1. lexical search (FTS/BM25)
 2. vector search (zvec)
 3. reciprocal rank fusion (RRF)
-4. optional rerank hooks (future-facing)
+4. bounded query expansion
+5. heuristic memory-item reranking
 
 ### Indexing pipeline
 
@@ -111,6 +197,7 @@ Then update:
 - `ai.embedding.provider` if you want to switch from local `llamacpp` to `gemini`
 - `ai.embedding.apiKey` / `ZMD_EMBED_API_KEY` when using `gemini`
 - `storage.baseDir` only if you want to override the default XDG-style storage root
+- `ai.queryExpansion.*` if you want to tune or disable default local-first query expansion
 
 If `config.json` is missing, `zmem` falls back to defaults.
 
@@ -125,6 +212,14 @@ Within each workspace directory, zmem stores:
 - `vectors/`
 
 Advanced overrides still work through `storage.baseDir`, `storage.dbPath`, `storage.zvecPath`, `ZMEM_STORAGE_BASE_DIR`, `ZMEM_DB_PATH`, and `ZMEM_ZVEC_PATH`.
+
+Query expansion can also be tuned with env vars such as:
+
+- `ZMEM_QUERY_EXPANSION_ENABLED`
+- `ZMEM_QUERY_EXPANSION_PROVIDER`
+- `ZMEM_QUERY_EXPANSION_MODEL`
+- `ZMEM_QUERY_EXPANSION_FALLBACK_MODEL`
+- `ZMEM_QUERY_EXPANSION_MAX_EXPANSIONS`
 
 ### 3) Ingest documents
 
@@ -155,8 +250,12 @@ npm run dev -- help
 Primary commands:
 
 - `ingest <path> [--workspace=<name>] [--logs=true|false]`
-- `query <query> [--workspace=<name>] [--mode=hybrid|lexical|vector] [--scopes=a,b] [--types=a,b] [--logs=true|false]`
+- `query <query> [--workspace=<name>] [--mode=hybrid|lexical|vector|recent|important|typed] [--scopes=a,b] [--types=a,b] [--expansion-mode=off|deterministic|llm] [--logs=true|false]`
 - `status [--workspace=<name>] [--logs=true|false]`
+- `init [--config=./config.json] [--workspace=<name>] [--root=<path>] [--storage-base-dir=<path>] [--enable-query-expansion=true|false] [--yes]`
+- `doctor [--config=./config.json] [--workspace=<name>]`
+- `config show [--config=./config.json] [--workspace=<name>]`
+- `models <status|check|pull> [--config=./config.json]`
 - `mcp [--config=./config.json] [--workspace=<name>] [--verbose=true|false]`
 
 Examples:
@@ -165,6 +264,25 @@ Examples:
 npm run dev -- ingest ./test-docs/search --workspace=default
 npm run dev -- query "sqlite" --mode=lexical --workspace=default
 npm run dev -- query "vector embeddings" --mode=vector --workspace=default
+npm run dev -- init --workspace=default --root=/absolute/path/to/repo --yes
+npm run dev -- doctor --workspace=default
+npm run dev -- models pull
+```
+
+## Local query expansion
+
+zmem now defaults to local-first query expansion for hybrid retrieval.
+
+- primary model: `hf:mradermacher/qmd-query-expansion-qwen3.5-2B-GGUF:Q4_K_M`
+- fallback model: `hf:mradermacher/qmd-query-expansion-qwen3.5-2B-GGUF:Q4_K_S`
+- expansion is skipped when lexical exact-match signal is already strong
+- if the local model is unavailable, zmem warns once and falls back to deterministic expansion
+
+To inspect or prepare local models:
+
+```bash
+npm run dev -- models status
+npm run dev -- models pull
 ```
 
 ## MCP usage
@@ -178,11 +296,15 @@ npm run dev -- mcp --workspace=default
 Implemented tools:
 
 - `memory_query`
+- `memory_search`
 - `memory_get`
 - `memory_list`
 - `memory_save`
 - `memory_delete`
 - `memory_status`
+- `memory_link`
+- `memory_neighbors`
+- `memory_edge_update`
 
 Optional admin tool:
 

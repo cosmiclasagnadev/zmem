@@ -22,6 +22,8 @@ import {
 } from "./types.js";
 import { isValidId, mapRowToMemoryItem, memoryItemExists } from "./utils.js";
 
+const SYMMETRIC_EDGE_RELATIONS = new Set<EdgeRelationType>(["related_to"]);
+
 type EdgeRow = {
   id: string;
   from_memory_id: string;
@@ -69,6 +71,11 @@ export function createEdgeRecord(ctx: CoreContext, input: CreateEdgeInput): Memo
 
   const now = new Date().toISOString();
   const id = data.id ?? `edge_${randomUUID()}`;
+
+  const existingSymmetric = getExistingEquivalentEdge(ctx, data.fromMemoryId, data.toMemoryId, data.relationType);
+  if (existingSymmetric) {
+    return existingSymmetric;
+  }
 
   try {
     ctx.db.db.prepare(`
@@ -137,7 +144,6 @@ export async function updateEdge(ctx: CoreContext, input: UpdateEdgeInput): Prom
   validateAcceptedState(nextStatus, nextAcceptedBy);
 
   const nextConfidence = parsed.confidence ?? existing.confidence;
-  const nextOrigin = parsed.origin ?? existing.origin;
   const nextJustification = parsed.justification ?? existing.justification;
   const updatedAt = new Date().toISOString();
 
@@ -145,7 +151,6 @@ export async function updateEdge(ctx: CoreContext, input: UpdateEdgeInput): Prom
     const result = ctx.db.db.prepare(`
       UPDATE memory_edges
       SET confidence = ?,
-          origin = ?,
           status = ?,
           justification = ?,
           accepted_by = ?,
@@ -153,7 +158,6 @@ export async function updateEdge(ctx: CoreContext, input: UpdateEdgeInput): Prom
       WHERE id = ?
     `).run(
       nextConfidence,
-      nextOrigin,
       nextStatus,
       nextJustification,
       nextAcceptedBy,
@@ -388,7 +392,19 @@ export async function listNeighbors(
       LIMIT ?
     `).all(...baseParams, ...recursiveParams, filters.limit) as NeighborRow[];
 
-    return rows.map(mapNeighborRow);
+    const deduped = new Map<string, NeighborRow>();
+    for (const row of rows) {
+      const key = `${row.neighbor_id}:${row.direction}:${row.relation_type}`;
+      const existing = deduped.get(key);
+      if (!existing || row.depth < existing.depth || (row.depth === existing.depth && row.id.localeCompare(existing.id) < 0)) {
+        deduped.set(key, row);
+      }
+    }
+
+    return [...deduped.values()]
+      .sort((left, right) => left.depth - right.depth || left.neighbor_title.localeCompare(right.neighbor_title) || left.id.localeCompare(right.id))
+      .slice(0, filters.limit)
+      .map(mapNeighborRow);
   } catch (error) {
     if (error instanceof CoreError) {
       throw error;
@@ -488,6 +504,24 @@ function getEdgeByCanonicalKey(
   `).get(fromMemoryId, toMemoryId, relationType, ctx.workspace, ctx.workspace) as EdgeRow | undefined;
 
   return row ? mapEdgeRow(row) : null;
+}
+
+function getExistingEquivalentEdge(
+  ctx: CoreContext,
+  fromMemoryId: string,
+  toMemoryId: string,
+  relationType: EdgeRelationType
+): MemoryEdge | null {
+  const direct = getEdgeByCanonicalKey(ctx, fromMemoryId, toMemoryId, relationType);
+  if (direct) {
+    return direct;
+  }
+
+  if (!SYMMETRIC_EDGE_RELATIONS.has(relationType)) {
+    return null;
+  }
+
+  return getEdgeByCanonicalKey(ctx, toMemoryId, fromMemoryId, relationType);
 }
 
 function buildEdgeFilter(

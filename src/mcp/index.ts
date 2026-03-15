@@ -11,8 +11,11 @@ import type { EmbeddingProvider } from "../embed/types.js";
 import {
   createEdge,
   createCoreContext,
+  createHeuristicEdgeSuggestionGenerator,
+  createSaveEdgeSuggestionProvider,
   deleteMemory,
   get,
+  getMany,
   list,
   listNeighbors,
   recall,
@@ -20,15 +23,18 @@ import {
   save,
   status,
   updateEdge,
+  updateEdgeStatus,
   CoreError,
   CreateEdgeInputSchema,
   ListNeighborsInputSchema,
   SaveMemoryInputSchema,
   RecallFiltersSchema,
   UpdateEdgeInputSchema,
+  UpdateEdgeStatusInputSchema,
 } from "../core/index.js";
 import { initializeVectorStore, type VectorCollection, type VectorStore } from "../vectors/index.js";
 import { resolveStoragePaths } from "../storage/paths.js";
+import { createQueryExpander } from "../search/query-expander-factory.js";
 import type { AppConfig } from "../config/schema.js";
 
 const MemoryTypeSchema = SaveMemoryInputSchema.shape.type;
@@ -83,6 +89,16 @@ const RecallHitSchema = z.object({
   type: MemoryTypeSchema,
 });
 
+const MemorySearchItemSchema = z.object({
+  id: z.string(),
+  title: z.string(),
+  type: MemoryTypeSchema,
+  scope: MemoryScopeSchema,
+  score: z.number(),
+  source: z.enum(["lex", "vec", "hybrid"]),
+  snippet: z.string(),
+});
+
 const MemoryQueryInputSchema = z.object({
   query: z.string().min(1, "query is required"),
   limit: ToolLimitSchema.optional(),
@@ -91,6 +107,7 @@ const MemoryQueryInputSchema = z.object({
   types: RecallFiltersSchema.shape.types.optional(),
   includeSuperseded: RecallFiltersSchema.shape.includeSuperseded.optional(),
   mode: RecallFiltersSchema.shape.mode.optional(),
+  expansionMode: RecallFiltersSchema.shape.expansionMode.optional(),
 }).strict();
 
 const MemoryQueryOutputSchema = z.object({
@@ -117,6 +134,7 @@ const MemorySearchInputSchema = z
     types: RecallFiltersSchema.shape.types.optional(),
     includeSuperseded: RecallFiltersSchema.shape.includeSuperseded.optional(),
     mode: RecallFiltersSchema.shape.mode.optional(),
+    expansionMode: RecallFiltersSchema.shape.expansionMode.optional(),
     includes: MemorySearchIncludesSchema.optional(),
   })
   .strict();
@@ -144,14 +162,16 @@ const MemorySearchEdgeSchema = z.object({
 const MemorySearchDebugSchema = z.object({
   query: z.string(),
   mode: RecallFiltersSchema.shape.mode,
+  expansionMode: RecallFiltersSchema.shape.expansionMode,
   includes: MemorySearchIncludesSchema,
   resultIds: z.array(z.string()),
   matchCount: z.number().int().nonnegative(),
 });
 
 const MemorySearchOutputSchema = z.object({
-  items: z.array(MemoryItemSchema),
+  items: z.array(MemorySearchItemSchema),
   count: z.number().int().nonnegative(),
+  memories: z.array(MemoryItemSchema).optional(),
   matches: z.array(MemorySearchMatchSchema).optional(),
   edges: z.array(MemorySearchEdgeSchema).optional(),
   explanations: z.array(MemorySearchExplanationSchema).optional(),
@@ -224,7 +244,7 @@ const MemoryNeighborsOutputSchema = z.object({
   count: z.number().int().nonnegative(),
 });
 
-const MemoryEdgeUpdateInputSchema = UpdateEdgeInputSchema;
+const MemoryEdgeUpdateInputSchema = UpdateEdgeStatusInputSchema;
 
 const MemoryEdgeUpdateOutputSchema = z.object({
   edge: MemoryEdgeSchema,
@@ -304,16 +324,17 @@ function createToolResult<T>(schema: z.ZodType<T>, payload: T) {
 function normalizeEdgeAcceptedBy(input: z.output<typeof CreateEdgeInputSchema>): z.output<typeof CreateEdgeInputSchema> {
   const nextStatus = input.status ?? (input.origin === "manual" ? "accepted" : "suggested");
   if (nextStatus !== "accepted") {
-    return { ...input, acceptedBy: null };
+    return { ...input, status: nextStatus, acceptedBy: null };
   }
 
   return {
     ...input,
+    status: nextStatus,
     acceptedBy: input.acceptedBy ?? "agent",
   };
 }
 
-function normalizeEdgeUpdateAcceptedBy(input: z.output<typeof UpdateEdgeInputSchema>): z.output<typeof UpdateEdgeInputSchema> {
+function normalizeEdgeUpdateAcceptedBy(input: z.output<typeof UpdateEdgeStatusInputSchema>): z.output<typeof UpdateEdgeStatusInputSchema> {
   if (input.status !== "accepted") {
     return input;
   }
@@ -482,6 +503,10 @@ export async function startMcpServer(options: StartMcpServerOptions = {}): Promi
       vectorCollection: resources.vectorCollection,
       workspace,
       config,
+      edgeSuggestionProvider: createSaveEdgeSuggestionProvider({
+        generator: createHeuristicEdgeSuggestionGenerator(),
+      }),
+      queryExpander: createQueryExpander(config),
     });
 
     resources.server = new McpServer({
@@ -507,6 +532,7 @@ export async function startMcpServer(options: StartMcpServerOptions = {}): Promi
             types: input.types,
             includeSuperseded: input.includeSuperseded,
             mode: input.mode,
+            expansionMode: input.expansionMode,
           });
 
           return {
@@ -529,6 +555,7 @@ export async function startMcpServer(options: StartMcpServerOptions = {}): Promi
           const includes = MemorySearchIncludesSchema.parse(input.includes ?? {});
           const query = input.query ?? "";
           const mode = input.mode ?? "hybrid";
+          const expansionMode = input.expansionMode ?? "off";
           logger.info(`memory_search called (${summarizeForLog("query", query)})`);
 
           const hits = await recall(ctx, query, {
@@ -538,15 +565,35 @@ export async function startMcpServer(options: StartMcpServerOptions = {}): Promi
             types: input.types,
             includeSuperseded: input.includeSuperseded,
             mode,
+            expansionMode,
           });
 
-          const items = (
-            await Promise.all(hits.map(async (hit) => get(ctx, hit.id)))
-          ).filter((item): item is z.infer<typeof MemoryItemSchema> => item !== null);
+          const memories = await getMany(ctx, hits.map((hit) => hit.id));
+          const memoriesById = new Map(memories.map((item) => [item.id, item]));
+          const items = hits.flatMap((hit) => {
+            const memory = memoriesById.get(hit.id);
+            if (!memory) {
+              return [];
+            }
+
+            return [{
+              id: memory.id,
+              title: memory.title,
+              type: memory.type,
+              scope: memory.scope,
+              score: hit.score,
+              source: hit.source,
+              snippet: hit.snippet,
+            }];
+          });
           const payload: z.infer<typeof MemorySearchOutputSchema> = {
             items,
             count: items.length,
           };
+
+          if (includes.debug) {
+            payload.memories = memories;
+          }
 
           if (includes.matches) {
             payload.matches = hits.map((hit) => ({
@@ -568,7 +615,7 @@ export async function startMcpServer(options: StartMcpServerOptions = {}): Promi
 
           if (includes.edges) {
             const edgeGroups = await Promise.all(
-              items.map(async (item) => ({
+              memories.map(async (item) => ({
                 memoryId: item.id,
                 neighbors: await listNeighbors(ctx, item.id, {
                   depth: 1,
@@ -592,6 +639,7 @@ export async function startMcpServer(options: StartMcpServerOptions = {}): Promi
             payload.debug = {
               query,
               mode,
+              expansionMode,
               includes,
               resultIds: items.map((item) => item.id),
               matchCount: hits.length,
@@ -707,8 +755,14 @@ export async function startMcpServer(options: StartMcpServerOptions = {}): Promi
                   FROM memory_edges e
                   INNER JOIN memory_items src ON src.id = e.from_memory_id
                   INNER JOIN memory_items dst ON dst.id = e.to_memory_id
-                  WHERE e.from_memory_id = ?
-                    AND e.to_memory_id = ?
+                  WHERE (
+                      (e.from_memory_id = ? AND e.to_memory_id = ?)
+                      OR (
+                        e.relation_type = 'related_to'
+                        AND e.from_memory_id = ?
+                        AND e.to_memory_id = ?
+                      )
+                    )
                     AND e.relation_type = ?
                     AND src.workspace = ?
                     AND dst.workspace = ?
@@ -717,6 +771,8 @@ export async function startMcpServer(options: StartMcpServerOptions = {}): Promi
               .get(
                 normalizedInput.fromMemoryId,
                 normalizedInput.toMemoryId,
+                normalizedInput.toMemoryId,
+                normalizedInput.fromMemoryId,
                 normalizedInput.relationType,
                 ctx.workspace,
                 ctx.workspace
@@ -738,7 +794,6 @@ export async function startMcpServer(options: StartMcpServerOptions = {}): Promi
             edge = await updateEdge(ctx, {
               id: edge.id,
               confidence: normalizedInput.confidence,
-              origin: normalizedInput.origin,
               status: normalizedInput.status,
               justification: normalizedInput.justification,
               acceptedBy: normalizedInput.acceptedBy,
@@ -777,14 +832,14 @@ export async function startMcpServer(options: StartMcpServerOptions = {}): Promi
       "memory_edge_update",
       {
         title: "Memory Edge Update",
-        description: "Update edge status or metadata explicitly.",
+        description: "Update edge moderation status explicitly.",
         inputSchema: MemoryEdgeUpdateInputSchema,
         outputSchema: MemoryEdgeUpdateOutputSchema,
       },
       async (input) =>
         executeTool(MemoryEdgeUpdateOutputSchema, async () => {
           logger.info(`memory_edge_update called (id=${input.id})`);
-          const edge = await updateEdge(ctx, normalizeEdgeUpdateAcceptedBy(MemoryEdgeUpdateInputSchema.parse(input)));
+          const edge = await updateEdgeStatus(ctx, normalizeEdgeUpdateAcceptedBy(MemoryEdgeUpdateInputSchema.parse(input)));
           return { edge };
         })
     );

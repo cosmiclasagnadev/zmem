@@ -78,38 +78,39 @@ function seedMemory(handle: DbHandle, input: { id: string; title: string; conten
 }
 
 test("deterministic expansion outputs stay bounded and labeled by strategy", async () => {
-  const plan = await expandQuery("why did we choose this", "deterministic");
+  const plan = await expandQuery("why did we choose this", "deterministic", undefined, { maxExpansions: 3 });
 
   assert(plan.variants.length <= 4);
-  assert.deepEqual(plan.variants.map((variant) => variant.strategy), ["original", "lexical", "semantic", "semantic"]);
+  assert.deepEqual(plan.variants.map((variant) => variant.strategy), ["original", "lexical", "semantic", "hyde"]);
   assert.deepEqual(plan.variants.map((variant) => variant.label), [
     "original:raw",
     "lexical:compact-keywords",
     "semantic:decision-rationale",
-    "semantic:tradeoff-analysis",
+    "hyde:information-about-query",
   ]);
+  assert.deepEqual(plan.variants.map((variant) => variant.target), ["both", "lex", "vec", "vec"]);
 });
 
-test("disabling expansion returns the original lexical behavior", async () => {
+test("disabling expansion preserves exact-match recall behavior", async () => {
   const { ctx, handle, cleanup } = createTestCoreContext();
 
   try {
     seedMemory(handle, {
       id: "mem_expansion_only",
       title: "Decision rationale",
-      content: "Decision rationale and tradeoff analysis for the selected approach.",
-      chunk: "decision rationale tradeoff analysis selected approach",
+      content: "Decision rationale and tradeoff analysis for why we choose the selected approach.",
+      chunk: "decision rationale tradeoff analysis why choose selected approach",
     });
 
-    const disabledHits = await recall(ctx, "why did we choose this", {
+    const disabledHits = await recall(ctx, "decision rationale", {
       mode: "lexical",
       topK: 5,
       expansionMode: "off",
     });
-    assert.deepEqual(disabledHits, []);
+    assert.deepEqual(disabledHits.map((hit) => hit.id), ["mem_expansion_only"]);
 
-    const expandedHits = await recall(ctx, "why did we choose this", {
-      mode: "lexical",
+    const expandedHits = await recall(ctx, "decision rationale", {
+      mode: "hybrid",
       topK: 5,
       expansionMode: "deterministic",
     });
@@ -127,6 +128,7 @@ test("off mode keeps only the original variant", async () => {
       strategy: "original",
       label: "original:raw",
       weight: 1,
+      target: "both",
     },
   ]);
 });

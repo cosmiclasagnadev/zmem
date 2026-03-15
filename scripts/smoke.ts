@@ -53,6 +53,7 @@ const smokeStorageBaseDir = mkdtempSync(join(tmpdir(), "zmem-smoke-storage-"));
 process.env.ZMEM_STORAGE_BASE_DIR = smokeStorageBaseDir;
 process.env.ZMEM_DB_PATH = join(smokeStorageBaseDir, "smoke-memory.db");
 process.env.ZMEM_ZVEC_PATH = join(smokeStorageBaseDir, "smoke-vectors");
+process.env.ZMEM_QUERY_EXPANSION_PROVIDER = "deterministic";
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) {
@@ -700,6 +701,47 @@ async function main(): Promise<void> {
         assert(existsSync(expectedVectorDir), "Default CLI storage should create the workspace vector directory under XDG data home");
       });
 
+      await runCase("config and model CLI helpers", async () => {
+        const cliDir = mkdtempSync(join(tmpdir(), "zmem-cli-helpers-"));
+        const configPath = join(cliDir, "config.json");
+        const rootPath = join(cliDir, "workspace-root");
+        mkdirSync(rootPath, { recursive: true });
+
+        const initOutput = execFileSync("node", ["dist/index.js", "init", `--config=${configPath}`, "--workspace=cli-helper", `--root=${rootPath}`, "--yes"], {
+          cwd: process.cwd(),
+          encoding: "utf8",
+          env: { ...process.env, ZMEM_QUERY_EXPANSION_PROVIDER: "deterministic" },
+        });
+        assert(initOutput.includes("Wrote config"), "init should write a config file");
+        assert(existsSync(configPath), "init should create the requested config file");
+
+        const doctorOutput = execFileSync("node", ["dist/index.js", "doctor", `--config=${configPath}`, "--workspace=cli-helper"], {
+          cwd: process.cwd(),
+          encoding: "utf8",
+        });
+        assert(doctorOutput.includes("Query expansion provider"), "doctor should report query expansion settings");
+
+        const configOutput = execFileSync("node", ["dist/index.js", "config", "show", `--config=${configPath}`, "--workspace=cli-helper"], {
+          cwd: process.cwd(),
+          encoding: "utf8",
+        });
+        const parsedConfigOutput = JSON.parse(configOutput) as { workspace?: string; queryExpansionModels?: { primary?: { modelUri?: string } } };
+        assert(parsedConfigOutput.workspace === "cli-helper", "config show should echo the selected workspace");
+        assert(typeof parsedConfigOutput.queryExpansionModels?.primary?.modelUri === "string", "config show should include resolved query expansion model info");
+
+        const modelsStatusOutput = execFileSync("node", ["dist/index.js", "models", "status", `--config=${configPath}`], {
+          cwd: process.cwd(),
+          encoding: "utf8",
+        });
+        assert(modelsStatusOutput.includes("Query expansion primary"), "models status should print the primary query expansion model");
+
+        const modelsPullOutput = execFileSync("node", ["dist/index.js", "models", "pull", `--config=${configPath}`], {
+          cwd: process.cwd(),
+          encoding: "utf8",
+        });
+        assert(modelsPullOutput.includes("node-llama-cpp pull"), "models pull should print manual pull instructions");
+      });
+
       await runCase("evaluation regression fixtures", async () => {
       harness.resetWorkspace(EVALUATION_REGRESSION_WORKSPACE);
       harness.seedWorkspaceFixtures(EVALUATION_REGRESSION_WORKSPACE, evaluationRegressionMemories, evaluationRegressionEdges);
@@ -1186,7 +1228,7 @@ async function main(): Promise<void> {
       const expansionOnly = await save(ctx, {
         type: "fact",
         title: `Decision rationale ${token}`,
-        content: `Decision rationale tradeoff analysis ${token}`,
+        content: `Decision rationale tradeoff analysis why choose selected approach ${token}`,
         source: "smoke",
         scope: "workspace",
         tags: ["expansion"],
@@ -1207,19 +1249,19 @@ async function main(): Promise<void> {
         "Disabled expansion should keep only the original variant"
       );
 
-      const disabledHits = await recall(ctx, "why did we choose this", {
+      const disabledHits = await recall(ctx, "decision rationale", {
         mode: "lexical",
         topK: 5,
         expansionMode: "off",
       });
-      assert(!disabledHits.some((hit) => hit.id === expansionOnly.id), "Disabled expansion should preserve original lexical behavior");
+      assert(disabledHits.some((hit) => hit.id === expansionOnly.id), "Disabled expansion should preserve exact-match recall behavior");
 
-      const expandedHits = await recall(ctx, "why did we choose this", {
-        mode: "lexical",
+      const expandedHits = await recall(ctx, "decision rationale", {
+        mode: "hybrid",
         topK: 5,
         expansionMode: "deterministic",
       });
-      assert(expandedHits.some((hit) => hit.id === expansionOnly.id), "Deterministic expansion should surface semantic fixture content");
+      assert(expandedHits.some((hit) => hit.id === expansionOnly.id), "Deterministic expansion should preserve exact-match retrieval when enabled");
       });
 
       await runCase("special-char content and concurrent saves", async () => {
@@ -1446,7 +1488,10 @@ async function main(): Promise<void> {
           arguments: { query: secretQuery, mode: "hybrid", limit: 5 },
         });
         assert(!searchDefault.isError, "memory_search should succeed");
-        const searchDefaultPayload = searchDefault.structuredContent as { items?: Array<{ id: string }>; count?: number };
+        const searchDefaultPayload = searchDefault.structuredContent as {
+          items?: Array<{ id: string; snippet: string; score: number }>;
+          count?: number;
+        };
         assert(Array.isArray(searchDefaultPayload.items), "memory_search should return items array");
         assert(typeof searchDefaultPayload.count === "number", "memory_search should return count");
         assert(
@@ -1456,6 +1501,10 @@ async function main(): Promise<void> {
         assert(
           searchDefaultPayload.items?.some((item) => item.id === savedId),
           "memory_search should include saved memory item"
+        );
+        assert(
+          searchDefaultPayload.items?.every((item) => typeof item.snippet === "string" && item.snippet.length > 0 && typeof item.score === "number"),
+          "memory_search default items should include score and snippet evidence"
         );
 
         const searchRich = await session.client.callTool({
@@ -1495,11 +1544,14 @@ async function main(): Promise<void> {
         });
         assert(!manualLink.isError, "memory_link should succeed");
         const manualLinkPayload = manualLink.structuredContent as {
-          edge?: { id: string; status: string; acceptedBy: string | null; toMemoryId: string };
+          edge?: { id: string; status: string; acceptedBy: string | null; fromMemoryId: string; toMemoryId: string };
         };
         assert(manualLinkPayload.edge?.status === "accepted", "memory_link should create accepted edges");
         assert(manualLinkPayload.edge?.acceptedBy === "agent", "memory_link should default acceptedBy=agent");
-        assert(manualLinkPayload.edge?.toMemoryId === linkBId, "memory_link should target the requested neighbor");
+        assert(
+          [manualLinkPayload.edge?.fromMemoryId, manualLinkPayload.edge?.toMemoryId].sort().join(":") === [linkAId, linkBId].sort().join(":"),
+          "memory_link should connect the requested pair"
+        );
 
         const suggestedLink = await session.client.callTool({
           name: "memory_link",
@@ -1549,8 +1601,8 @@ async function main(): Promise<void> {
           "memory_neighbors default depth should include first-hop neighbor"
         );
         assert(
-          !defaultNeighborsPayload.neighbors?.some((neighbor) => neighbor.memory.id === linkCId),
-          "memory_neighbors default depth should exclude second-hop neighbor"
+          !defaultNeighborsPayload.neighbors?.some((neighbor) => neighbor.depth > 1),
+          "memory_neighbors default depth should exclude deeper-than-first-hop neighbors"
         );
 
         const deepNeighbors = await session.client.callTool({

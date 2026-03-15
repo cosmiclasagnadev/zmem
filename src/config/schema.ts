@@ -5,7 +5,8 @@ const retrievalDefaultsSchema = z.object({
   topKVec: z.number().int().positive().default(30),
   rerankTopK: z.number().int().positive().default(20),
   minScore: z.number().min(0).max(1).default(0.25),
-  includeSuperseded: z.boolean().default(false)
+  includeSuperseded: z.boolean().default(false),
+  expansionMode: z.enum(["off", "deterministic", "llm"]).default("llm")
 });
 
 const workspaceSchema = z.object({
@@ -35,6 +36,24 @@ const rerankConfigSchema = z.object({
   topK: z.number().int().positive().default(20)
 });
 
+const queryExpansionConfigSchema = z.object({
+  enabled: z.boolean().default(true),
+  provider: z.enum(["deterministic", "llamacpp"]).default("llamacpp"),
+  model: z.string().default("hf:mradermacher/qmd-query-expansion-qwen3.5-2B-GGUF:Q4_K_M"),
+  fallbackModel: z.string().default("hf:mradermacher/qmd-query-expansion-qwen3.5-2B-GGUF:Q4_K_S"),
+  maxExpansions: z.number().int().positive().max(8).default(3),
+  includeLexical: z.boolean().default(true),
+  timeoutMs: z.number().int().positive().default(4000),
+  strongSignalBypass: z.boolean().default(true),
+  strongSignalMinScore: z.number().min(0).max(1).default(0.72),
+  strongSignalMinGap: z.number().min(0).max(1).default(0.12),
+  contextSize: z.number().int().positive().default(2048),
+  temperature: z.number().min(0).max(2).default(0.4),
+  topK: z.number().int().positive().default(20),
+  topP: z.number().min(0).max(1).default(0.8),
+  cacheSize: z.number().int().positive().default(128),
+}).default({});
+
 export const appConfigSchema = z.object({
   defaults: z.object({
     retrievalMode: z.enum(["hybrid", "lexical", "vector"]).default("hybrid"),
@@ -43,10 +62,12 @@ export const appConfigSchema = z.object({
   }),
   ai: z.object({
     embedding: embeddingConfigSchema,
-    rerank: rerankConfigSchema
+    rerank: rerankConfigSchema,
+    queryExpansion: queryExpansionConfigSchema,
   }).default({
     embedding: {},
-    rerank: {}
+    rerank: {},
+    queryExpansion: {},
   }),
   workspaces: z.array(workspaceSchema).default([]),
   storage: z.object({
@@ -59,4 +80,5 @@ export const appConfigSchema = z.object({
 export type AppConfig = z.infer<typeof appConfigSchema>;
 export type EmbeddingConfig = z.infer<typeof embeddingConfigSchema>;
 export type RerankConfig = z.infer<typeof rerankConfigSchema>;
+export type QueryExpansionConfig = z.infer<typeof queryExpansionConfigSchema>;
 export type WorkspaceConfig = z.infer<typeof workspaceSchema>;

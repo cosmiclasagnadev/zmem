@@ -32,9 +32,11 @@ type SeedMemoryRow = {
 function createTestCoreContext(options: {
   workspace?: string;
   edgeSuggestionProvider?: EdgeSuggestionProvider;
+  vectorInsertErrorAtChunk?: number;
 } = {}): {
   ctx: CoreContext;
   handle: DbHandle;
+  vectorIds: Set<string>;
   cleanup: () => void;
 } {
   const dir = mkdtempSync(join(tmpdir(), "zmem-save-core-test-"));
@@ -44,12 +46,22 @@ function createTestCoreContext(options: {
 
   const embedProvider = createMockEmbeddingProvider(3);
 
+  const vectorIds = new Set<string>();
+  let insertCount = 0;
   const vectorCollection: VectorCollection = {
-    insert() {},
+    insert(id) {
+      insertCount += 1;
+      if (options.vectorInsertErrorAtChunk && insertCount === options.vectorInsertErrorAtChunk) {
+        throw new Error("simulated vector insert failure");
+      }
+      vectorIds.add(id);
+    },
     query() {
       return [];
     },
-    delete() {},
+    delete(id) {
+      vectorIds.delete(id);
+    },
     close() {},
   };
 
@@ -69,6 +81,7 @@ function createTestCoreContext(options: {
   return {
     ctx,
     handle,
+    vectorIds,
     cleanup: () => {
       closeDatabase(handle);
       rmSync(dir, { recursive: true, force: true });
@@ -299,6 +312,39 @@ test("save reuses the canonical edge row for duplicate explicit links", async ()
 
     assert.equal(countCanonicalEdges(handle, saved.id, "mem_target", "related_to"), 1);
     assert.equal(getEdgeRows(handle, saved.id).length, 1);
+  } finally {
+    cleanup();
+  }
+});
+
+test("save rolls back memory rows, edges, chunks, and vectors when suggestion generation fails", async () => {
+  const { ctx, handle, vectorIds, cleanup } = createTestCoreContext({
+    edgeSuggestionProvider: {
+      async suggestForSave() {
+        throw new Error("suggestion provider failure");
+      },
+    },
+  });
+
+  try {
+    await assert.rejects(
+      save(ctx, {
+        type: "fact",
+        title: "Rollback candidate",
+        content: "Rollback candidate content that should be fully removed on failure.",
+        source: "test",
+        scope: "workspace",
+      }),
+      /Failed generating save-time edge suggestions/
+    );
+
+    const rows = handle.db.prepare(`SELECT id, status FROM memory_items WHERE workspace = ?`).all(ctx.workspace) as Array<{ id: string; status: string }>;
+    assert.equal(rows.length, 0);
+    const chunks = handle.db.prepare(`SELECT COUNT(*) AS count FROM content_chunks`).get() as { count: number };
+    assert.equal(chunks.count, 0);
+    const embeddings = handle.db.prepare(`SELECT COUNT(*) AS count FROM chunk_embeddings`).get() as { count: number };
+    assert.equal(embeddings.count, 0);
+    assert.equal(vectorIds.size, 0);
   } finally {
     cleanup();
   }

@@ -1,5 +1,7 @@
 import type { DbHandle } from "../db/index.js";
 import type { EmbeddingProvider } from "../embed/types.js";
+import type { QueryExpansionConfig } from "../config/schema.js";
+import type { QueryExpander } from "./query-expansion.js";
 import type { VectorCollection } from "../vectors/index.js";
 import type { MemoryScope, MemoryType } from "../types/memory.js";
 import { debug } from "../utils/logger.js";
@@ -7,7 +9,7 @@ import { searchLexicalChunks, type ChunkLexicalHit } from "./lexical.js";
 import { searchVectorChunks, type ChunkVectorHit } from "./vector.js";
 import { rrfFusion, type SearchHit, type FusionOptions } from "./fusion.js";
 import { buildMemoryRollups, type ChunkCandidateHit, type MemoryRollup, type QueryHit } from "./rollup.js";
-import { expandQuery, type QueryExpansionMode } from "./query-expansion.js";
+import { expandQuery, type QueryExpansionMode, type QueryExpansionTarget } from "./query-expansion.js";
 import { createHeuristicMemoryItemReranker } from "./rerank.js";
 
 export {
@@ -29,6 +31,18 @@ export {
   type MemoryRerankSignals,
 } from "./rerank.js";
 
+export {
+  createCachedQueryExpander,
+  createDeterministicQueryExpander,
+  createOffExpansionPlan,
+  type QueryExpander,
+  type QueryExpansionPlan,
+  type QueryExpansionRequest,
+  type QueryExpansionTarget,
+  type QueryExpansionVariant,
+  type QueryExpansionMode,
+} from "./query-expansion.js";
+
 export interface QueryInput {
   query: string;
   workspace?: string;
@@ -39,6 +53,7 @@ export interface QueryInput {
   minScore?: number;
   mode?: "hybrid" | "lexical" | "vector" | "recent" | "important" | "typed";
   expansionMode?: QueryExpansionMode;
+  queryExpansionConfig?: QueryExpansionConfig;
 }
 
 const GRAPH_TRAVERSAL_DEFAULT_DEPTH = 1;
@@ -593,7 +608,8 @@ export async function queryMemories(
   db: DbHandle,
   embedProvider: EmbeddingProvider,
   vectorCollection: VectorCollection,
-  input: QueryInput
+  input: QueryInput,
+  queryExpander?: QueryExpander
 ): Promise<QueryHit[]> {
   const {
     query,
@@ -604,9 +620,11 @@ export async function queryMemories(
     topK = 30,
     minScore = 0.25,
     mode = "hybrid",
-    expansionMode = "off",
+    expansionMode,
+    queryExpansionConfig,
   } = input;
   const statuses = includeSuperseded ? ["active", "archived"] : ["active"];
+  const effectiveExpansionMode = expansionMode ?? (queryExpansionConfig?.enabled === false ? "off" : "llm");
 
   if (mode === "recent") {
     return queryByRecency({
@@ -638,7 +656,42 @@ export async function queryMemories(
     minScore,
   };
 
-  const expansionPlan = await expandQuery(query, expansionMode);
+  const shouldAttemptStrongSignalBypass =
+    queryExpansionConfig?.strongSignalBypass !== false &&
+    effectiveExpansionMode === "llm" &&
+    (mode === "hybrid" || mode === "important" || mode === "typed") &&
+    query.trim().length > 0 &&
+    !hasRelationalIntent(query);
+
+  const initialLexicalProbe = shouldAttemptStrongSignalBypass
+    ? searchLexicalChunks(db, {
+        query,
+        workspace,
+        topK: 5,
+        scopes: scopes as MemoryScope[],
+        types,
+        statuses,
+      })
+    : [];
+
+  const topProbeScore = initialLexicalProbe[0]?.score ?? 0;
+  const secondProbeScore = initialLexicalProbe[1]?.score ?? 0;
+  const shouldBypassExpansion =
+    shouldAttemptStrongSignalBypass &&
+    topProbeScore >= (queryExpansionConfig?.strongSignalMinScore ?? 0.72) &&
+    topProbeScore - secondProbeScore >= (queryExpansionConfig?.strongSignalMinGap ?? 0.12);
+
+  const expansionPlan = shouldBypassExpansion
+    ? await expandQuery(query, "off", queryExpander, {
+        maxExpansions: queryExpansionConfig?.maxExpansions,
+        includeLexical: queryExpansionConfig?.includeLexical,
+        workspace,
+      })
+    : await expandQuery(query, effectiveExpansionMode, queryExpander, {
+        maxExpansions: queryExpansionConfig?.maxExpansions,
+        includeLexical: queryExpansionConfig?.includeLexical,
+        workspace,
+      });
   debug(() =>
     `[QueryExpansion] mode=${expansionPlan.mode} variants=${expansionPlan.variants
       .map((variant) => `${variant.label}=>${variant.query}`)
@@ -650,8 +703,11 @@ export async function queryMemories(
   const runLexical = mode === "hybrid" || mode === "lexical" || mode === "important" || mode === "typed";
   const runVector = mode === "hybrid" || mode === "vector" || mode === "important" || mode === "typed";
 
+  const shouldRunLexicalForTarget = (target: QueryExpansionTarget): boolean => target === "both" || target === "lex";
+  const shouldRunVectorForTarget = (target: QueryExpansionTarget): boolean => target === "both" || target === "vec";
+
   for (const variant of expansionPlan.variants) {
-    if (runLexical) {
+    if (runLexical && shouldRunLexicalForTarget(variant.target)) {
       const variantHits = searchLexicalChunks(db, {
         query: variant.query,
         workspace,
@@ -663,7 +719,7 @@ export async function queryMemories(
       lexResults.push(...variantHits);
     }
 
-    if (runVector) {
+    if (runVector && shouldRunVectorForTarget(variant.target)) {
       const variantHits = (await searchVectorChunks(db, embedProvider, vectorCollection, {
         query: variant.query,
         workspace,

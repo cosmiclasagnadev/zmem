@@ -10,6 +10,12 @@ export interface ResolvedStoragePaths {
   workspaceSlug: string;
 }
 
+export function resolveModelStorageDir(config: AppConfig): string {
+  const configuredBaseDir = process.env.ZMEM_STORAGE_BASE_DIR || config.storage.baseDir;
+  const baseDir = configuredBaseDir ? resolve(configuredBaseDir) : defaultStorageBaseDir();
+  return join(baseDir, "models");
+}
+
 function slugifyWorkspace(workspace: string): string {
   const normalized = workspace
     .trim()

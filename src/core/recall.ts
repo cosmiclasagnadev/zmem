@@ -78,7 +78,9 @@ export async function recall(
         minScore: parsed.minScore,
         mode: parsed.mode,
         expansionMode: parsed.expansionMode,
-      }
+        queryExpansionConfig: ctx.config.ai.queryExpansion,
+      },
+      ctx.queryExpander
     );
     
     const mapped = results.map((r) => ({

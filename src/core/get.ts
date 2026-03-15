@@ -61,3 +61,57 @@ export async function get(
     );
   }
 }
+
+export async function getMany(
+  ctx: CoreContext,
+  ids: string[]
+): Promise<MemoryItem[]> {
+  const uniqueIds = [...new Set(ids.filter((id) => isValidId(id)))];
+  if (uniqueIds.length === 0) {
+    return [];
+  }
+
+  const placeholders = uniqueIds.map(() => "?").join(", ");
+
+  try {
+    const rows = ctx.db.db
+      .prepare(`
+        SELECT
+          id, type, title, content, summary, source, scope, workspace,
+          tags, importance, status, supersedes_id, content_hash,
+          created_at, updated_at
+        FROM memory_items
+        WHERE workspace = ?
+          AND id IN (${placeholders})
+      `)
+      .all(ctx.workspace, ...uniqueIds) as Array<{
+        id: string;
+        type: string;
+        title: string;
+        content: string;
+        summary: string;
+        source: string;
+        scope: string;
+        workspace: string;
+        tags: string;
+        importance: number;
+        status: string;
+        supersedes_id: string | null;
+        content_hash: string;
+        created_at: string;
+        updated_at: string;
+      }>;
+
+    const rowsById = new Map(rows.map((row) => [row.id, mapRowToMemoryItem(row)]));
+    return uniqueIds.flatMap((id) => {
+      const item = rowsById.get(id);
+      return item ? [item] : [];
+    });
+  } catch (error) {
+    throw new CoreError(
+      `Failed to fetch memory items: ${error instanceof Error ? error.message : String(error)}`,
+      "DATABASE",
+      error instanceof Error ? error : undefined
+    );
+  }
+}

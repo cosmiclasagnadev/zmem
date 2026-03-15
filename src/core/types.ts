@@ -66,7 +66,7 @@ export const RecallFiltersSchema = z.object({
   topK: z.number().int().positive().default(30),
   minScore: z.number().min(0).max(1).default(0.25),
   mode: z.enum(["hybrid", "lexical", "vector", "recent", "important", "typed"]).default("hybrid"),
-  expansionMode: z.enum(["off", "deterministic"]).default("off"),
+  expansionMode: z.enum(["off", "deterministic", "llm"]).optional(),
 }).strict();
 
 export const CreateEdgeInputSchema = z.object({
@@ -84,14 +84,12 @@ export const CreateEdgeInputSchema = z.object({
 export const UpdateEdgeInputSchema = z.object({
   id: z.string().min(1, "id is required"),
   confidence: z.number().min(0).max(1).optional(),
-  origin: EdgeOriginSchema.optional(),
   status: EdgeStatusSchema.optional(),
   justification: z.string().optional(),
   acceptedBy: EdgeAcceptanceProvenanceSchema.nullable().optional(),
 }).strict().refine(
   (value) =>
     value.confidence !== undefined ||
-    value.origin !== undefined ||
     value.status !== undefined ||
     value.justification !== undefined ||
     value.acceptedBy !== undefined,

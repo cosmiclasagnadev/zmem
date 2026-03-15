@@ -11,6 +11,8 @@ import type {
 import { mapRowToMemoryItem, type MemoryItemRow } from "./utils.js";
 import { searchVector } from "../search/vector.js";
 
+const SYMMETRIC_EDGE_RELATIONS = new Set<EdgeRelationType>(["related_to"]);
+
 export const DEFAULT_EDGE_SUGGESTION_TOP_K = 3;
 export const DEFAULT_EDGE_SUGGESTION_SEMANTIC_LIMIT = 6;
 export const DEFAULT_EDGE_SUGGESTION_RECENT_LIMIT = 6;
@@ -64,6 +66,29 @@ export interface SaveEdgeSuggestionPipelineOptions {
   semanticCandidateLimit?: number;
   recentCandidateLimit?: number;
   rejectedConfidenceDelta?: number;
+}
+
+export function createHeuristicEdgeSuggestionGenerator(): EdgeSuggestionGenerator {
+  return {
+    async suggest({ input, candidatePool }) {
+      const queryTerms = tokenize(input.title + " " + input.content);
+      return candidatePool.allCandidates.slice(0, 6).map((candidate, index) => {
+        const candidateTerms = tokenize(candidate.title + " " + candidate.summary + " " + candidate.content);
+        const overlap = computeOverlapScore(queryTerms, candidateTerms);
+        const semanticScore = candidate.semanticScore ?? 0;
+        const recencyBoost = candidate.recencyRank === null ? 0 : Math.max(0, 1 - (candidate.recencyRank - 1) * 0.1);
+        const evidenceScore = normalizeScore(0.55 * semanticScore + 0.25 * overlap + 0.2 * recencyBoost - index * 0.02);
+
+        return {
+          toMemoryId: candidate.memoryId,
+          relationType: "related_to" as const,
+          confidence: evidenceScore,
+          evidenceScore,
+          justification: buildHeuristicJustification(candidate),
+        };
+      });
+    },
+  };
 }
 
 type ResolvedPipelineOptions = Required<
@@ -348,11 +373,11 @@ function finalizeSaveEdgeSuggestions(
       acceptedBy: null,
     };
     const rank = draft.evidenceScore ?? confidence;
-    const key = `${edge.fromMemoryId}:${edge.toMemoryId}:${edge.relationType}`;
-    const existing = canonical.get(key);
-    if (!existing || rank > existing.rank) {
-      canonical.set(key, { edge, rank });
-    }
+      const key = toSuggestionKey(edge);
+      const existing = canonical.get(key);
+      if (!existing || rank > existing.rank) {
+        canonical.set(key, { edge, rank });
+      }
   }
 
   return [...canonical.values()]
@@ -381,7 +406,7 @@ function getExistingCanonicalEdge(
   toMemoryId: string,
   relationType: EdgeRelationType
 ): EdgeRow | null {
-  const row = ctx.db.db.prepare(`
+  let row = ctx.db.db.prepare(`
     SELECT id, status, confidence
     FROM memory_edges
     WHERE from_memory_id = ?
@@ -389,7 +414,26 @@ function getExistingCanonicalEdge(
       AND relation_type = ?
   `).get(fromMemoryId, toMemoryId, relationType) as EdgeRow | undefined;
 
+  if (!row && SYMMETRIC_EDGE_RELATIONS.has(relationType)) {
+    row = ctx.db.db.prepare(`
+      SELECT id, status, confidence
+      FROM memory_edges
+      WHERE from_memory_id = ?
+        AND to_memory_id = ?
+        AND relation_type = ?
+    `).get(toMemoryId, fromMemoryId, relationType) as EdgeRow | undefined;
+  }
+
   return row ?? null;
+}
+
+function toSuggestionKey(edge: CreateEdgeInput): string {
+  if (!SYMMETRIC_EDGE_RELATIONS.has(edge.relationType)) {
+    return `${edge.fromMemoryId}:${edge.toMemoryId}:${edge.relationType}`;
+  }
+
+  const ordered = [edge.fromMemoryId, edge.toMemoryId].sort();
+  return `${ordered[0]}:${ordered[1]}:${edge.relationType}`;
 }
 
 function compareCandidateStrength(candidate: EdgeSuggestionCandidate): number {
@@ -426,4 +470,40 @@ function normalizeScore(value: number): number {
 
 function getConfidence(edge: CreateEdgeInput): number {
   return edge.confidence ?? 0.5;
+}
+
+function tokenize(value: string): string[] {
+  return value
+    .toLowerCase()
+    .split(/[^a-z0-9]+/i)
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 4);
+}
+
+function computeOverlapScore(left: string[], right: string[]): number {
+  if (left.length === 0 || right.length === 0) {
+    return 0;
+  }
+
+  const rightSet = new Set(right);
+  let matches = 0;
+  for (const token of new Set(left)) {
+    if (rightSet.has(token)) {
+      matches += 1;
+    }
+  }
+
+  return matches / Math.max(new Set(left).size, 1);
+}
+
+function buildHeuristicJustification(candidate: EdgeSuggestionCandidate): string {
+  if (candidate.sources.length === 2) {
+    return "Suggested from semantic similarity and recent memory overlap";
+  }
+
+  if (candidate.sources.includes("semantic")) {
+    return "Suggested from semantic similarity to existing memory";
+  }
+
+  return "Suggested from recent related memory context";
 }

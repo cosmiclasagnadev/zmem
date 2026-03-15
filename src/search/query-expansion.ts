@@ -1,14 +1,15 @@
-export const QueryExpansionStrategyValues = ["original", "lexical", "semantic"] as const;
+export const QueryExpansionStrategyValues = ["original", "lexical", "semantic", "hyde"] as const;
 
 export type QueryExpansionStrategy = (typeof QueryExpansionStrategyValues)[number];
-
-export type QueryExpansionMode = "off" | "deterministic";
+export type QueryExpansionMode = "off" | "deterministic" | "llm";
+export type QueryExpansionTarget = "both" | "lex" | "vec";
 
 export interface QueryExpansionVariant {
   query: string;
   strategy: QueryExpansionStrategy;
   label: string;
   weight: number;
+  target: QueryExpansionTarget;
 }
 
 export interface QueryExpansionPlan {
@@ -17,18 +18,28 @@ export interface QueryExpansionPlan {
   variants: QueryExpansionVariant[];
 }
 
+export interface QueryExpansionRequest {
+  query: string;
+  mode: QueryExpansionMode;
+  maxExpansions: number;
+  includeLexical: boolean;
+  workspace?: string;
+}
+
 export interface QueryExpander {
-  expand(query: string): Promise<QueryExpansionPlan>;
+  expand(request: QueryExpansionRequest): Promise<QueryExpansionPlan>;
 }
 
 export interface DeterministicQueryExpanderOptions {
   maxLexicalVariants?: number;
   maxSemanticVariants?: number;
+  maxHydeVariants?: number;
   maxTotalVariants?: number;
 }
 
 const DEFAULT_MAX_LEXICAL_VARIANTS = 1;
-const DEFAULT_MAX_SEMANTIC_VARIANTS = 2;
+const DEFAULT_MAX_SEMANTIC_VARIANTS = 1;
+const DEFAULT_MAX_HYDE_VARIANTS = 1;
 const DEFAULT_MAX_TOTAL_VARIANTS = 4;
 
 const STOP_WORDS = new Set([
@@ -50,22 +61,31 @@ const STOP_WORDS = new Set([
   "with",
 ]);
 
-const SEMANTIC_RULES: Array<{ test: RegExp; variants: string[] }> = [
+const SEMANTIC_RULES: Array<{ test: RegExp; variants: Array<{ text: string; strategy: QueryExpansionStrategy; label: string; target: QueryExpansionTarget; weight: number }> }> = [
   {
     test: /what changed/,
-    variants: ["change summary", "previous baseline"],
+    variants: [
+      { text: "change summary", strategy: "semantic", label: "semantic:change-summary", target: "vec", weight: 0.92 },
+      { text: "previous baseline", strategy: "semantic", label: "semantic:previous-baseline", target: "vec", weight: 0.9 },
+    ],
   },
   {
     test: /why did we (choose|decide)/,
-    variants: ["decision rationale", "tradeoff analysis"],
+    variants: [
+      { text: "decision rationale", strategy: "semantic", label: "semantic:decision-rationale", target: "vec", weight: 0.92 },
+      { text: "tradeoff analysis", strategy: "semantic", label: "semantic:tradeoff-analysis", target: "vec", weight: 0.9 },
+    ],
   },
   {
     test: /related context/,
-    variants: ["connected context", "related note"],
+    variants: [
+      { text: "connected context", strategy: "semantic", label: "semantic:connected-context", target: "vec", weight: 0.92 },
+      { text: "related note", strategy: "semantic", label: "semantic:related-note", target: "vec", weight: 0.9 },
+    ],
   },
 ];
 
-function normalizeWhitespace(value: string): string {
+export function normalizeWhitespace(value: string): string {
   return value.trim().replace(/\s+/g, " ");
 }
 
@@ -96,6 +116,16 @@ function dedupeVariants(variants: QueryExpansionVariant[], maxTotalVariants: num
   return deduped;
 }
 
+function buildOriginalVariant(query: string): QueryExpansionVariant {
+  return {
+    query,
+    strategy: "original",
+    label: "original:raw",
+    weight: 1,
+    target: "both",
+  };
+}
+
 function buildLexicalVariants(query: string, maxVariants: number): QueryExpansionVariant[] {
   const tokens = tokenizeQuery(query);
   const compact = tokens.filter((token) => !STOP_WORDS.has(token));
@@ -107,6 +137,7 @@ function buildLexicalVariants(query: string, maxVariants: number): QueryExpansio
       strategy: "lexical",
       label: "lexical:compact-keywords",
       weight: 0.96,
+      target: "lex",
     });
   }
 
@@ -124,10 +155,11 @@ function buildSemanticVariants(query: string, maxVariants: number): QueryExpansi
 
     for (const variant of rule.variants) {
       variants.push({
-        query: variant,
-        strategy: "semantic",
-        label: `semantic:${variant.replace(/\s+/g, "-")}`,
-        weight: 0.92,
+        query: variant.text,
+        strategy: variant.strategy,
+        label: variant.label,
+        weight: variant.weight,
+        target: variant.target,
       });
       if (variants.length >= maxVariants) {
         return variants;
@@ -138,24 +170,50 @@ function buildSemanticVariants(query: string, maxVariants: number): QueryExpansi
   return variants;
 }
 
+function buildHydeVariants(query: string, maxVariants: number): QueryExpansionVariant[] {
+  if (maxVariants <= 0) {
+    return [];
+  }
+
+  return [{
+    query: `information about ${normalizeWhitespace(query)}`,
+    strategy: "hyde" as const,
+    label: "hyde:information-about-query",
+    weight: 0.88,
+    target: "vec" as const,
+  }].slice(0, maxVariants);
+}
+
+export function createOffExpansionPlan(query: string): QueryExpansionPlan {
+  const originalQuery = normalizeWhitespace(query);
+  return {
+    mode: "off",
+    originalQuery,
+    variants: [buildOriginalVariant(originalQuery)],
+  };
+}
+
 export function createDeterministicQueryExpander(options: DeterministicQueryExpanderOptions = {}): QueryExpander {
   const maxLexicalVariants = options.maxLexicalVariants ?? DEFAULT_MAX_LEXICAL_VARIANTS;
   const maxSemanticVariants = options.maxSemanticVariants ?? DEFAULT_MAX_SEMANTIC_VARIANTS;
-  const maxTotalVariants = options.maxTotalVariants ?? DEFAULT_MAX_TOTAL_VARIANTS;
+  const maxHydeVariants = options.maxHydeVariants ?? DEFAULT_MAX_HYDE_VARIANTS;
+  const defaultMaxTotalVariants = options.maxTotalVariants ?? DEFAULT_MAX_TOTAL_VARIANTS;
 
   return {
-    async expand(query: string): Promise<QueryExpansionPlan> {
-      const originalQuery = normalizeWhitespace(query);
+    async expand(request: QueryExpansionRequest): Promise<QueryExpansionPlan> {
+      const originalQuery = normalizeWhitespace(request.query);
+
+      if (request.mode === "off") {
+        return createOffExpansionPlan(originalQuery);
+      }
+
+      const maxTotalVariants = Math.max(1, Math.min(request.maxExpansions + 1, defaultMaxTotalVariants));
       const variants = dedupeVariants(
         [
-          {
-            query: originalQuery,
-            strategy: "original",
-            label: "original:raw",
-            weight: 1,
-          },
-          ...buildLexicalVariants(originalQuery, maxLexicalVariants),
+          buildOriginalVariant(originalQuery),
+          ...(request.includeLexical ? buildLexicalVariants(originalQuery, maxLexicalVariants) : []),
           ...buildSemanticVariants(originalQuery, maxSemanticVariants),
+          ...buildHydeVariants(originalQuery, maxHydeVariants),
         ],
         maxTotalVariants
       );
@@ -169,26 +227,53 @@ export function createDeterministicQueryExpander(options: DeterministicQueryExpa
   };
 }
 
+export function createCachedQueryExpander(expander: QueryExpander, maxEntries = 128): QueryExpander {
+  const cache = new Map<string, QueryExpansionPlan>();
+
+  return {
+    async expand(request: QueryExpansionRequest): Promise<QueryExpansionPlan> {
+      const key = JSON.stringify({
+        query: normalizeWhitespace(request.query).toLowerCase(),
+        mode: request.mode,
+        maxExpansions: request.maxExpansions,
+        includeLexical: request.includeLexical,
+        workspace: request.workspace ?? "",
+      });
+
+      const cached = cache.get(key);
+      if (cached) {
+        cache.delete(key);
+        cache.set(key, cached);
+        return cached;
+      }
+
+      const plan = await expander.expand(request);
+      cache.set(key, plan);
+      if (cache.size > maxEntries) {
+        const oldest = cache.keys().next().value;
+        if (oldest) {
+          cache.delete(oldest);
+        }
+      }
+      return plan;
+    },
+  };
+}
+
 export async function expandQuery(
   query: string,
-  mode: QueryExpansionMode = "off",
-  options?: DeterministicQueryExpanderOptions
+  mode: QueryExpansionMode,
+  expander?: QueryExpander,
+  options?: DeterministicQueryExpanderOptions & { maxExpansions?: number; includeLexical?: boolean; workspace?: string }
 ): Promise<QueryExpansionPlan> {
   const originalQuery = normalizeWhitespace(query);
-  if (mode === "off") {
-    return {
-      mode,
-      originalQuery,
-      variants: [
-        {
-          query: originalQuery,
-          strategy: "original",
-          label: "original:raw",
-          weight: 1,
-        },
-      ],
-    };
-  }
-
-  return createDeterministicQueryExpander(options).expand(originalQuery);
+  const deterministicExpander = createDeterministicQueryExpander(options);
+  const effectiveExpander = mode === "llm" ? (expander ?? deterministicExpander) : deterministicExpander;
+  return effectiveExpander.expand({
+    query: originalQuery,
+    mode,
+    maxExpansions: options?.maxExpansions ?? DEFAULT_MAX_TOTAL_VARIANTS - 1,
+    includeLexical: options?.includeLexical ?? true,
+    workspace: options?.workspace,
+  });
 }

@@ -385,4 +385,20 @@ export function runMigrations(handle: DbHandle): void {
       VALUES (6, datetime('now'))
     `).run();
   }
+
+  const v7Applied = db.prepare(
+    `SELECT 1 FROM schema_migrations WHERE version = 7`
+  ).get();
+
+  if (!v7Applied) {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_items_workspace_status_updated_created ON memory_items(workspace, status, updated_at DESC, created_at DESC);`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_items_workspace_status_importance_updated ON memory_items(workspace, status, importance DESC, updated_at DESC);`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_edges_from_status_origin ON memory_edges(from_memory_id, status, origin);`);
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_memory_edges_to_status_origin ON memory_edges(to_memory_id, status, origin);`);
+
+    db.prepare(`
+      INSERT INTO schema_migrations (version, applied_at)
+      VALUES (7, datetime('now'))
+    `).run();
+  }
 }

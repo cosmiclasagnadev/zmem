@@ -12,7 +12,7 @@ export {
 
 // Export operations
 export { save } from "./save.js";
-export { get } from "./get.js";
+export { get, getMany } from "./get.js";
 export { list } from "./list.js";
 export { deleteMemory, deleteMemory as delete } from "./delete.js";
 export { recall } from "./recall.js";
@@ -21,6 +21,7 @@ export { status } from "./status.js";
 export { createEdge, updateEdge, updateEdgeStatus, moderateEdgeState, listNeighbors } from "./edges.js";
 export {
   buildSaveEdgeSuggestionCandidatePool,
+  createHeuristicEdgeSuggestionGenerator,
   createSaveEdgeSuggestionProvider,
   persistSuggestedEdgeRecord,
   DEFAULT_EDGE_SUGGESTION_TOP_K,

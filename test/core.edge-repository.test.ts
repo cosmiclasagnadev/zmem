@@ -15,6 +15,7 @@ import {
   createCoreContext,
   createEdge,
   listNeighbors,
+  updateEdge,
   updateEdgeStatus,
   type CoreContext,
 } from "../src/core/index.js";
@@ -275,6 +276,77 @@ test("listNeighbors honors direction, filters, and default depth of 1", async ()
         { id: "mem_e", depth: 2 },
       ]
     );
+  } finally {
+    cleanup();
+  }
+});
+
+test("related_to edges reuse the existing reverse-direction row", async () => {
+  const { ctx, cleanup } = createTestCoreContext();
+
+  try {
+    seedMemories(ctx.db, [
+      { id: "mem_z", title: "Memory Z", content: "Z" },
+      { id: "mem_a", title: "Memory A", content: "A" },
+    ]);
+
+    const first = await createEdge(ctx, {
+      fromMemoryId: "mem_z",
+      toMemoryId: "mem_a",
+      relationType: "related_to",
+      confidence: 0.7,
+      origin: "manual",
+      status: "accepted",
+      justification: "Symmetric relation",
+      acceptedBy: "user",
+    });
+
+    const second = await createEdge(ctx, {
+      fromMemoryId: "mem_a",
+      toMemoryId: "mem_z",
+      relationType: "related_to",
+      confidence: 0.7,
+      origin: "manual",
+      status: "accepted",
+      justification: "Reverse creation should reuse",
+      acceptedBy: "user",
+    });
+
+    assert.equal(first.id, second.id);
+    assert.equal(second.fromMemoryId, "mem_z");
+    assert.equal(second.toMemoryId, "mem_a");
+  } finally {
+    cleanup();
+  }
+});
+
+test("updateEdge cannot rewrite edge origin provenance", async () => {
+  const { ctx, cleanup } = createTestCoreContext();
+
+  try {
+    seedMemories(ctx.db, [
+      { id: "mem_a", title: "Memory A", content: "A" },
+      { id: "mem_b", title: "Memory B", content: "B" },
+    ]);
+
+    const created = await createEdge(ctx, {
+      fromMemoryId: "mem_a",
+      toMemoryId: "mem_b",
+      relationType: "supports",
+      confidence: 0.6,
+      origin: "llm",
+      status: "suggested",
+      justification: "LLM suggestion",
+    });
+
+    const updated = await updateEdge(ctx, {
+      id: created.id,
+      confidence: 0.9,
+      justification: "Human reviewed confidence",
+    });
+
+    assert.equal(updated.origin, "llm");
+    assert.equal(updated.confidence, 0.9);
   } finally {
     cleanup();
   }
