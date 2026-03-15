@@ -8,7 +8,7 @@ import type {
   EdgeStatus,
   SaveMemoryData,
 } from "./types.js";
-import { buildEdgeEquivalenceKey, isSymmetricEdgeRelation } from "./edge-rules.js";
+import { buildEdgeEquivalenceKey, buildEquivalentEdgePairs } from "./edge-rules.js";
 import { mapRowToMemoryItem, type MemoryItemRow } from "./utils.js";
 import { searchVector } from "../search/vector.js";
 
@@ -408,25 +408,21 @@ function getExistingCanonicalEdge(
   toMemoryId: string,
   relationType: EdgeRelationType
 ): EdgeRow | null {
-  let row = ctx.db.db.prepare(`
-    SELECT id, status, confidence
-    FROM memory_edges
-    WHERE from_memory_id = ?
-      AND to_memory_id = ?
-      AND relation_type = ?
-  `).get(fromMemoryId, toMemoryId, relationType) as EdgeRow | undefined;
-
-  if (!row && isSymmetricEdgeRelation(relationType)) {
-    row = ctx.db.db.prepare(`
+  for (const pair of buildEquivalentEdgePairs(fromMemoryId, toMemoryId, relationType)) {
+    const row = ctx.db.db.prepare(`
       SELECT id, status, confidence
       FROM memory_edges
       WHERE from_memory_id = ?
         AND to_memory_id = ?
         AND relation_type = ?
-    `).get(toMemoryId, fromMemoryId, relationType) as EdgeRow | undefined;
+    `).get(pair.fromMemoryId, pair.toMemoryId, relationType) as EdgeRow | undefined;
+
+    if (row) {
+      return row;
+    }
   }
 
-  return row ?? null;
+  return null;
 }
 
 function toSuggestionKey(edge: CreateEdgeInput): string {

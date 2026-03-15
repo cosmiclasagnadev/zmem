@@ -32,6 +32,7 @@ import {
   UpdateEdgeInputSchema,
   UpdateEdgeStatusInputSchema,
 } from "../core/index.js";
+import { buildEquivalentEdgePairs } from "../core/edge-rules.js";
 import { initializeVectorStore, type VectorCollection, type VectorStore } from "../vectors/index.js";
 import { resolveStoragePaths } from "../storage/paths.js";
 import { createQueryExpander } from "../search/query-expander-factory.js";
@@ -555,7 +556,6 @@ export async function startMcpServer(options: StartMcpServerOptions = {}): Promi
           const includes = MemorySearchIncludesSchema.parse(input.includes ?? {});
           const query = input.query ?? "";
           const mode = input.mode ?? "hybrid";
-          const expansionMode = input.expansionMode ?? "off";
           logger.info(`memory_search called (${summarizeForLog("query", query)})`);
 
           const hits = await recall(ctx, query, {
@@ -565,7 +565,7 @@ export async function startMcpServer(options: StartMcpServerOptions = {}): Promi
             types: input.types,
             includeSuperseded: input.includeSuperseded,
             mode,
-            expansionMode,
+            expansionMode: input.expansionMode,
           });
 
           const memories = await getMany(ctx, hits.map((hit) => hit.id));
@@ -639,7 +639,7 @@ export async function startMcpServer(options: StartMcpServerOptions = {}): Promi
             payload.debug = {
               query,
               mode,
-              expansionMode,
+              expansionMode: input.expansionMode ?? ctx.config.defaults.retrieval.expansionMode,
               includes,
               resultIds: items.map((item) => item.id),
               matchCount: hits.length,
@@ -747,6 +747,13 @@ export async function startMcpServer(options: StartMcpServerOptions = {}): Promi
         executeTool(MemoryLinkOutputSchema, async () => {
           logger.info(`memory_link called (from=${input.fromMemoryId}, to=${input.toMemoryId})`);
           const normalizedInput = normalizeEdgeAcceptedBy(MemoryLinkInputSchema.parse(input));
+          const equivalentPairs = buildEquivalentEdgePairs(
+            normalizedInput.fromMemoryId,
+            normalizedInput.toMemoryId,
+            normalizedInput.relationType
+          );
+          const directPair = equivalentPairs[0]!;
+          const reversePair = equivalentPairs[1] ?? null;
           const existingEdgeId = (
             ctx.db.db
               .prepare(
@@ -757,11 +764,7 @@ export async function startMcpServer(options: StartMcpServerOptions = {}): Promi
                   INNER JOIN memory_items dst ON dst.id = e.to_memory_id
                   WHERE (
                       (e.from_memory_id = ? AND e.to_memory_id = ?)
-                      OR (
-                        e.relation_type = 'related_to'
-                        AND e.from_memory_id = ?
-                        AND e.to_memory_id = ?
-                      )
+                      OR (? IS NOT NULL AND e.from_memory_id = ? AND e.to_memory_id = ?)
                     )
                     AND e.relation_type = ?
                     AND src.workspace = ?
@@ -769,10 +772,11 @@ export async function startMcpServer(options: StartMcpServerOptions = {}): Promi
                 `
               )
               .get(
-                normalizedInput.fromMemoryId,
-                normalizedInput.toMemoryId,
-                normalizedInput.toMemoryId,
-                normalizedInput.fromMemoryId,
+                directPair.fromMemoryId,
+                directPair.toMemoryId,
+                reversePair?.fromMemoryId ?? null,
+                reversePair?.fromMemoryId ?? "",
+                reversePair?.toMemoryId ?? "",
                 normalizedInput.relationType,
                 ctx.workspace,
                 ctx.workspace

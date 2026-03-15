@@ -20,7 +20,7 @@ import {
   type UpdateEdgeInput,
   type UpdateEdgeStatusInput,
 } from "./types.js";
-import { isSymmetricEdgeRelation } from "./edge-rules.js";
+import { buildEquivalentEdgePairs, isSymmetricEdgeRelation } from "./edge-rules.js";
 import { isValidId, mapRowToMemoryItem, memoryItemExists } from "./utils.js";
 
 type EdgeRow = {
@@ -511,16 +511,14 @@ function getExistingEquivalentEdge(
   toMemoryId: string,
   relationType: EdgeRelationType
 ): MemoryEdge | null {
-  const direct = getEdgeByCanonicalKey(ctx, fromMemoryId, toMemoryId, relationType);
-  if (direct) {
-    return direct;
+  for (const pair of buildEquivalentEdgePairs(fromMemoryId, toMemoryId, relationType)) {
+    const edge = getEdgeByCanonicalKey(ctx, pair.fromMemoryId, pair.toMemoryId, relationType);
+    if (edge) {
+      return edge;
+    }
   }
 
-  if (!isSymmetricEdgeRelation(relationType)) {
-    return null;
-  }
-
-  return getEdgeByCanonicalKey(ctx, toMemoryId, fromMemoryId, relationType);
+  return null;
 }
 
 function buildEdgeFilter(
