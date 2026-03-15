@@ -511,7 +511,7 @@ export async function startMcpServer(options: StartMcpServerOptions = {}): Promi
 
     resources.server = new McpServer({
       name: "zmem",
-      version: "0.1.0",
+      version: "0.1.1",
     });
 
     resources.server.registerTool(
