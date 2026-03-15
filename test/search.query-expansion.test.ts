@@ -8,11 +8,11 @@ import { appConfigSchema } from "../src/config/schema.js";
 import { createCoreContext, recall, type CoreContext } from "../src/core/index.js";
 import { closeDatabase, openDatabase, type DbHandle } from "../src/db/index.js";
 import { runMigrations } from "../src/db/migrate.js";
-import { expandQuery } from "../src/search/query-expansion.js";
+import { expandQuery, type QueryExpander } from "../src/search/query-expansion.js";
 import type { VectorCollection } from "../src/vectors/index.js";
 import { createMockEmbeddingProvider } from "./helpers/mock-embedding-provider.js";
 
-function createTestCoreContext(): {
+function createTestCoreContext(configOverrides?: Record<string, unknown>, queryExpander?: QueryExpander): {
   ctx: CoreContext;
   handle: DbHandle;
   cleanup: () => void;
@@ -42,7 +42,9 @@ function createTestCoreContext(): {
       defaults: {
         retrieval: {},
       },
+      ...configOverrides,
     }),
+    queryExpander,
   });
 
   return {
@@ -131,4 +133,57 @@ test("off mode keeps only the original variant", async () => {
       target: "both",
     },
   ]);
+});
+
+test("configured default expansion mode is honored when recall input omits expansionMode", async () => {
+  const customExpander: QueryExpander = {
+    async expand(request) {
+      return {
+        mode: request.mode,
+        originalQuery: request.query,
+        variants: [
+          {
+            query: request.query,
+            strategy: "original",
+            label: "original:raw",
+            weight: 1,
+            target: "both",
+          },
+          {
+            query: "decision rationale",
+            strategy: "lexical",
+            label: `lexical:${request.mode}`,
+            weight: 0.95,
+            target: "lex",
+          },
+        ],
+      };
+    },
+  };
+
+  const { ctx, handle, cleanup } = createTestCoreContext({
+    defaults: {
+      retrieval: {
+        expansionMode: "llm",
+      },
+    },
+  }, customExpander);
+
+  try {
+    seedMemory(handle, {
+      id: "mem_default_deterministic",
+      title: "Decision rationale",
+      content: "Decision rationale and tradeoff analysis for the selected approach.",
+      chunk: "decision rationale tradeoff analysis selected approach",
+    });
+
+    const hits = await recall(ctx, "no direct lexical overlap", {
+      mode: "lexical",
+      topK: 5,
+    });
+
+    assert.deepEqual(hits.map((hit) => hit.id), ["mem_default_deterministic"]);
+  } finally {
+    cleanup();
+  }
 });

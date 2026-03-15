@@ -8,10 +8,9 @@ import type {
   EdgeStatus,
   SaveMemoryData,
 } from "./types.js";
+import { buildEdgeEquivalenceKey, isSymmetricEdgeRelation } from "./edge-rules.js";
 import { mapRowToMemoryItem, type MemoryItemRow } from "./utils.js";
 import { searchVector } from "../search/vector.js";
-
-const SYMMETRIC_EDGE_RELATIONS = new Set<EdgeRelationType>(["related_to"]);
 
 export const DEFAULT_EDGE_SUGGESTION_TOP_K = 3;
 export const DEFAULT_EDGE_SUGGESTION_SEMANTIC_LIMIT = 6;
@@ -414,7 +413,7 @@ function getExistingCanonicalEdge(
       AND relation_type = ?
   `).get(fromMemoryId, toMemoryId, relationType) as EdgeRow | undefined;
 
-  if (!row && SYMMETRIC_EDGE_RELATIONS.has(relationType)) {
+  if (!row && isSymmetricEdgeRelation(relationType)) {
     row = ctx.db.db.prepare(`
       SELECT id, status, confidence
       FROM memory_edges
@@ -428,12 +427,7 @@ function getExistingCanonicalEdge(
 }
 
 function toSuggestionKey(edge: CreateEdgeInput): string {
-  if (!SYMMETRIC_EDGE_RELATIONS.has(edge.relationType)) {
-    return `${edge.fromMemoryId}:${edge.toMemoryId}:${edge.relationType}`;
-  }
-
-  const ordered = [edge.fromMemoryId, edge.toMemoryId].sort();
-  return `${ordered[0]}:${ordered[1]}:${edge.relationType}`;
+  return buildEdgeEquivalenceKey(edge.fromMemoryId, edge.toMemoryId, edge.relationType);
 }
 
 function compareCandidateStrength(candidate: EdgeSuggestionCandidate): number {

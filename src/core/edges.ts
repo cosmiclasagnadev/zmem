@@ -20,9 +20,8 @@ import {
   type UpdateEdgeInput,
   type UpdateEdgeStatusInput,
 } from "./types.js";
+import { isSymmetricEdgeRelation } from "./edge-rules.js";
 import { isValidId, mapRowToMemoryItem, memoryItemExists } from "./utils.js";
-
-const SYMMETRIC_EDGE_RELATIONS = new Set<EdgeRelationType>(["related_to"]);
 
 type EdgeRow = {
   id: string;
@@ -517,7 +516,7 @@ function getExistingEquivalentEdge(
     return direct;
   }
 
-  if (!SYMMETRIC_EDGE_RELATIONS.has(relationType)) {
+  if (!isSymmetricEdgeRelation(relationType)) {
     return null;
   }
 

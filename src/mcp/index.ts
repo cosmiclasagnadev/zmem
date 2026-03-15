@@ -784,7 +784,6 @@ export async function startMcpServer(options: StartMcpServerOptions = {}): Promi
           let edge = initialEdge;
           const requiresUpdate =
             edge.confidence !== normalizedInput.confidence ||
-            edge.origin !== normalizedInput.origin ||
             edge.status !== (normalizedInput.status ?? edge.status) ||
             edge.justification !== normalizedInput.justification ||
             edge.acceptedBy !== (normalizedInput.acceptedBy ?? edge.acceptedBy);

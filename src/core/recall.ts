@@ -59,6 +59,7 @@ export async function recall(
     const parsed = RecallFiltersSchema.parse(filters);
     const normalizedQuery = query.trim();
     const allowsQueryless = parsed.mode === "recent" || parsed.mode === "important" || parsed.mode === "typed";
+    const effectiveExpansionMode = parsed.expansionMode ?? ctx.config.defaults.retrieval.expansionMode;
 
     if (normalizedQuery.length === 0 && !allowsQueryless) {
       throw new CoreError("Query cannot be empty", "VALIDATION");
@@ -77,7 +78,7 @@ export async function recall(
         topK: parsed.topK,
         minScore: parsed.minScore,
         mode: parsed.mode,
-        expansionMode: parsed.expansionMode,
+        expansionMode: effectiveExpansionMode,
         queryExpansionConfig: ctx.config.ai.queryExpansion,
       },
       ctx.queryExpander
