@@ -22,6 +22,23 @@
     "rerank": {
       "enabled": false,
       "topK": 20
+    },
+    "queryExpansion": {
+      "enabled": true,
+      "provider": "llamacpp",
+      "model": "hf:mradermacher/qmd-query-expansion-qwen3.5-2B-GGUF:Q4_K_M",
+      "fallbackModel": "hf:mradermacher/qmd-query-expansion-qwen3.5-2B-GGUF:Q4_K_S",
+      "maxExpansions": 3,
+      "includeLexical": true,
+      "timeoutMs": 4000,
+      "strongSignalBypass": true,
+      "strongSignalMinScore": 0.72,
+      "strongSignalMinGap": 0.12,
+      "contextSize": 2048,
+      "temperature": 0.4,
+      "topK": 20,
+      "topP": 0.8,
+      "cacheSize": 128
     }
   },
   "workspaces": [
@@ -34,7 +51,6 @@
     }
   ],
   "storage": {
-    "dbPath": "./data/memory.db",
-    "zvecPath": "./data/vectors"
+    "baseDir": "/absolute/path/to/zmem-storage"
   }
 }

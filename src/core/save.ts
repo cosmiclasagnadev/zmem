@@ -1,8 +1,10 @@
 import type { CoreContext } from "./context.js";
 import type { MemoryScope, MemoryType } from "../types/memory.js";
-import type { SaveMemoryInput, SaveResult } from "./types.js";
+import type { CreateEdgeInput, SaveMemoryInput, SaveResult } from "./types.js";
 import { SaveMemoryInputSchema, CoreError } from "./types.js";
 import { generateMemoryId, getMemoryItemStatus } from "./utils.js";
+import { createEdgeRecord } from "./edges.js";
+import { persistSuggestedEdgeRecord } from "./edge-suggestions.js";
 import { chunkDocument } from "../ingest/chunker.js";
 import { createHash } from "node:crypto";
 import { deleteVectorsForMemory } from "./vector-sync.js";
@@ -59,6 +61,22 @@ export async function save(
     
     supersededId = data.supersedesId;
   }
+
+  const rollbackNewMemory = (): void => {
+    try {
+      deleteVectorsForMemory(ctx, id);
+    } catch {
+      // Best effort vector cleanup.
+    }
+
+    try {
+      ctx.db.db.transaction(() => {
+        ctx.db.db.prepare(`DELETE FROM memory_items WHERE id = ? AND workspace = ?`).run(id, ctx.workspace);
+      })();
+    } catch {
+      // Best effort database cleanup.
+    }
+  };
   
   try {
     // Generate content hash for change detection
@@ -90,10 +108,6 @@ export async function save(
       INSERT OR REPLACE INTO chunk_embeddings (chunk_id, embedded_at, model)
       VALUES (?, ?, ?)
     `);
-    const deleteNewMemory = ctx.db.db.prepare(`
-      DELETE FROM memory_items WHERE id = ? AND workspace = ?
-    `);
-
     const createPendingTx = ctx.db.db.transaction(() => {
       insertMemoryItem.run(
         id,
@@ -137,10 +151,7 @@ export async function save(
         ctx.vectorCollection.insert(chunk.chunkId, chunk.embedding, chunk.metadata);
       }
     } catch (vectorError) {
-      // Roll back the pending item if vector writes fail.
-      ctx.db.db.transaction(() => {
-        deleteNewMemory.run(id, ctx.workspace);
-      })();
+      rollbackNewMemory();
       throw new CoreError(
         `Vector sync failed while creating memory item: ${vectorError instanceof Error ? vectorError.message : String(vectorError)}`,
         "DATABASE",
@@ -148,8 +159,47 @@ export async function save(
       );
     }
 
+    let suggestedEdges: CreateEdgeInput[] = [];
+    try {
+      suggestedEdges = data.suggestEdges
+        ? normalizeSaveEdgeSuggestions(
+            id,
+            (await ctx.edgeSuggestionProvider?.suggestForSave({
+              ctx,
+              memoryId: id,
+              workspace: ctx.workspace,
+              input: data,
+            })) ?? []
+          )
+        : [];
+    } catch (suggestionError) {
+      rollbackNewMemory();
+      throw new CoreError(
+        `Failed generating save-time edge suggestions: ${suggestionError instanceof Error ? suggestionError.message : String(suggestionError)}`,
+        "DATABASE",
+        suggestionError instanceof Error ? suggestionError : undefined
+      );
+    }
+
     const finalizeNow = new Date().toISOString();
     const finalizeTx = ctx.db.db.transaction(() => {
+      for (const link of data.links) {
+        createEdgeRecord(ctx, {
+          fromMemoryId: id,
+          toMemoryId: link.toMemoryId,
+          relationType: link.relationType,
+          confidence: link.confidence,
+          origin: "manual",
+          status: "accepted",
+          justification: link.justification,
+          acceptedBy: link.acceptedBy,
+        });
+      }
+
+      for (const suggestion of suggestedEdges) {
+        persistSuggestedEdgeRecord(ctx, suggestion);
+      }
+
       updateMemoryStatus.run("active", finalizeNow, id, ctx.workspace);
       if (supersededId) {
         updateMemoryStatus.run("archived", finalizeNow, supersededId, ctx.workspace);
@@ -159,15 +209,7 @@ export async function save(
     try {
       finalizeTx();
     } catch (finalizeError) {
-      // Compensate vector side and remove pending/new row.
-      try {
-        deleteVectorsForMemory(ctx, id);
-      } catch {
-        // Best effort cleanup.
-      }
-      ctx.db.db.transaction(() => {
-        deleteNewMemory.run(id, ctx.workspace);
-      })();
+      rollbackNewMemory();
       throw new CoreError(
         `Failed finalizing save transaction: ${finalizeError instanceof Error ? finalizeError.message : String(finalizeError)}`,
         "DATABASE",
@@ -203,6 +245,16 @@ export async function save(
       error instanceof Error ? error : undefined
     );
   }
+}
+
+function normalizeSaveEdgeSuggestions(memoryId: string, suggestions: CreateEdgeInput[]): CreateEdgeInput[] {
+  return suggestions.map((suggestion) => ({
+    ...suggestion,
+    fromMemoryId: memoryId,
+    status: suggestion.status ?? "suggested",
+    origin: suggestion.origin ?? "llm",
+    acceptedBy: suggestion.acceptedBy ?? null,
+  }));
 }
 
 /**

@@ -55,20 +55,24 @@ export async function recall(
 ): Promise<RecallHit[]> {
   const startedAt = performance.now();
 
-  // Validate query
-  if (!query || query.trim().length === 0) {
-    throw new CoreError("Query cannot be empty", "VALIDATION");
-  }
-  
   try {
     const parsed = RecallFiltersSchema.parse(filters);
+    const normalizedQuery = query.trim();
+    const allowsQueryless = parsed.mode === "recent" || parsed.mode === "important" || parsed.mode === "typed";
+    const effectiveExpansionMode = ctx.config.ai.queryExpansion.enabled === false
+      ? "off"
+      : (parsed.expansionMode ?? ctx.config.defaults.retrieval.expansionMode);
+
+    if (normalizedQuery.length === 0 && !allowsQueryless) {
+      throw new CoreError("Query cannot be empty", "VALIDATION");
+    }
 
     const results = await queryMemories(
       ctx.db,
       ctx.embedProvider,
       ctx.vectorCollection,
       {
-        query: query.trim(),
+        query: normalizedQuery,
         workspace: ctx.workspace,
         scopes: parsed.scopes ?? ["workspace", "global"],
         types: parsed.types,
@@ -76,7 +80,10 @@ export async function recall(
         topK: parsed.topK,
         minScore: parsed.minScore,
         mode: parsed.mode,
-      }
+        expansionMode: effectiveExpansionMode,
+        queryExpansionConfig: ctx.config.ai.queryExpansion,
+      },
+      ctx.queryExpander
     );
     
     const mapped = results.map((r) => ({
@@ -87,6 +94,7 @@ export async function recall(
       snippet: r.snippet,
       scope: r.scope,
       type: r.type,
+      explanation: r.explanation,
     }));
 
     recordRecallMetrics(performance.now() - startedAt, parsed.mode ?? "hybrid", mapped.length);

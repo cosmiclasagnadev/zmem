@@ -1,0 +1,77 @@
+{
+  "scenarios": [
+    {
+      "name": "best-hit-dominant-over-moderate-cluster",
+      "topK": 10,
+      "hits": [
+        {
+          "id": "mem_single_0",
+          "memoryId": "mem_single",
+          "title": "Single great hit",
+          "snippet": "single decisive snippet",
+          "score": 0.97,
+          "source": "vec",
+          "scope": "workspace",
+          "type": "fact",
+          "status": "active"
+        },
+        {
+          "id": "mem_multi_0",
+          "memoryId": "mem_multi",
+          "title": "Moderate cluster",
+          "snippet": "moderate snippet one",
+          "score": 0.65,
+          "source": "lex",
+          "scope": "workspace",
+          "type": "fact",
+          "status": "active"
+        },
+        {
+          "id": "mem_multi_1",
+          "memoryId": "mem_multi",
+          "title": "Moderate cluster",
+          "snippet": "moderate snippet two",
+          "score": 0.64,
+          "source": "vec",
+          "scope": "workspace",
+          "type": "fact",
+          "status": "active"
+        },
+        {
+          "id": "mem_multi_2",
+          "memoryId": "mem_multi",
+          "title": "Moderate cluster",
+          "snippet": "moderate snippet three",
+          "score": 0.63,
+          "source": "vec",
+          "scope": "workspace",
+          "type": "fact",
+          "status": "active"
+        }
+      ],
+      "expectedOrder": ["mem_single", "mem_multi"],
+      "expectedScores": {
+        "mem_single": 0.6984,
+        "mem_multi": 0.688561
+      },
+      "expectedEvidence": {
+        "mem_single": {
+          "bestHitScore": 0.97,
+          "multiChunkSupport": 0,
+          "chunkDiversity": 0,
+          "uniqueChunkCount": 1,
+          "uniqueSources": ["vec"],
+          "bestChunkId": "mem_single_0"
+        },
+        "mem_multi": {
+          "bestHitScore": 0.65,
+          "multiChunkSupport": 0.682606,
+          "chunkDiversity": 0.976923,
+          "uniqueChunkCount": 3,
+          "uniqueSources": ["lex", "vec"],
+          "bestChunkId": "mem_multi_0"
+        }
+      }
+    }
+  ]
+}

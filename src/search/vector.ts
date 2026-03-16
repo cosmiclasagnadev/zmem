@@ -15,6 +15,18 @@ export interface VectorSearchHit {
   status: string;
 }
 
+export interface ChunkVectorHit {
+  id: string;
+  memoryId: string;
+  title: string;
+  snippet: string;
+  score: number;
+  source: "vec";
+  scope: MemoryScope;
+  type: MemoryType;
+  status: string;
+}
+
 export interface VectorSearchOptions {
   query: string;
   workspace?: string;
@@ -57,6 +69,15 @@ function buildZvecFilter(
   return conditions.length > 0 ? conditions.join(" and ") : undefined;
 }
 
+interface ChunkLookup {
+  memoryId: string;
+  title: string;
+  chunkText: string;
+  scope: MemoryScope;
+  type: MemoryType;
+  status: string;
+}
+
 interface MemoryLookup {
   title: string;
   content: string;
@@ -85,6 +106,56 @@ function batchLookupMemories(
 
   for (const row of rows) {
     result.set(row.id, { title: row.title, content: row.content, status: row.status });
+  }
+
+  return result;
+}
+
+function batchLookupChunks(
+  db: DbHandle,
+  workspace: string | undefined,
+  chunkIds: string[],
+  statuses: string[]
+): Map<string, ChunkLookup> {
+  const result = new Map<string, ChunkLookup>();
+  if (chunkIds.length === 0) return result;
+
+  const unique = [...new Set(chunkIds)];
+  const placeholders = unique.map(() => "?").join(", ");
+  const statusPlaceholders = statuses.map(() => "?").join(", ");
+  const workspaceClause = workspace ? "AND m.workspace = ?" : "";
+  const params = workspace ? [...unique, ...statuses, workspace] : [...unique, ...statuses];
+  const rows = db.db
+    .prepare(
+      `
+      SELECT c.id, c.memory_id, c.chunk_text, m.title, m.scope, m.type, m.status
+      FROM content_chunks c
+      JOIN memory_items m ON c.memory_id = m.id
+      WHERE c.id IN (${placeholders})
+        AND c.deleted_at IS NULL
+        AND m.status IN (${statusPlaceholders})
+        ${workspaceClause}
+      `
+    )
+    .all(...params) as Array<{
+      id: string;
+      memory_id: string;
+      chunk_text: string;
+      title: string;
+      scope: MemoryScope;
+      type: MemoryType;
+      status: string;
+    }>;
+
+  for (const row of rows) {
+    result.set(row.id, {
+      memoryId: row.memory_id,
+      title: row.title,
+      chunkText: row.chunk_text,
+      scope: row.scope,
+      type: row.type,
+      status: row.status,
+    });
   }
 
   return result;
@@ -124,6 +195,54 @@ export async function searchVector(
   try {
     const embedding = await embedProvider.embed(query);
     const filter = buildZvecFilter(workspace, scopes, types, statuses);
+    const results = vectorCollection.query(embedding, topK, filter);
+
+    if (!results || results.length === 0) {
+      return [];
+    }
+
+    const memoryIds = results.map((hit) => hit.id.replace(/_[0-9]+$/, ""));
+    const lookup = batchLookupMemories(db, workspace, memoryIds, statuses);
+
+    return results
+      .map((hit, index) => {
+        const memoryId = memoryIds[index];
+        const memory = lookup.get(memoryId);
+        if (!memory) return null;
+
+        return {
+          id: memoryId,
+          title: memory.title,
+          snippet: extractSnippet(memory.content, query),
+          score: hit.score,
+          source: "vec" as const,
+          scope: (hit.fields.scope as MemoryScope) || "workspace",
+          type: (hit.fields.type as MemoryType) || "fact",
+          status: memory.status,
+        };
+      })
+      .filter((hit): hit is VectorSearchHit => hit !== null);
+  } catch (err) {
+    error(() => `[VectorSearch] Error: ${err}`);
+    return [];
+  }
+}
+
+export async function searchVectorChunks(
+  db: DbHandle,
+  embedProvider: EmbeddingProvider,
+  vectorCollection: VectorCollection,
+  options: VectorSearchOptions
+): Promise<ChunkVectorHit[]> {
+  const { query, workspace, topK = 30, scopes, types, statuses = ["active"] } = options;
+
+  if (!query.trim()) {
+    return [];
+  }
+
+  try {
+    const embedding = await embedProvider.embed(query);
+    const filter = buildZvecFilter(workspace, scopes, types, statuses);
 
     const results = vectorCollection.query(embedding, topK, filter);
 
@@ -131,27 +250,26 @@ export async function searchVector(
       return [];
     }
 
-    // Extract unique memory IDs and batch-fetch from DB
-    const memoryIds = results.map((hit) => hit.id.replace(/_[0-9]+$/, ""));
-    const lookup = batchLookupMemories(db, workspace, memoryIds, statuses);
+    const chunkIds = results.map((hit) => hit.id);
+    const lookup = batchLookupChunks(db, workspace, chunkIds, statuses);
 
     return results
-      .map((hit, i) => {
-      const memoryId = memoryIds[i];
-      const mem = lookup.get(memoryId);
-      if (!mem) return null;
+      .map((hit) => {
+      const chunk = lookup.get(hit.id);
+      if (!chunk) return null;
       return {
-        id: memoryId,
-        title: mem.title,
-        snippet: extractSnippet(mem.content, query),
+        id: hit.id,
+        memoryId: chunk.memoryId,
+        title: chunk.title,
+        snippet: extractSnippet(chunk.chunkText, query),
         score: hit.score,
         source: "vec" as const,
-        scope: (hit.fields.scope as MemoryScope) || "workspace",
-        type: (hit.fields.type as MemoryType) || "fact",
-        status: mem.status,
+        scope: (hit.fields.scope as MemoryScope) || chunk.scope || "workspace",
+        type: (hit.fields.type as MemoryType) || chunk.type || "fact",
+        status: chunk.status,
       };
     })
-      .filter((hit): hit is VectorSearchHit => hit !== null);
+      .filter((hit): hit is ChunkVectorHit => hit !== null);
   } catch (err) {
     error(() => `[VectorSearch] Error: ${err}`);
     return [];

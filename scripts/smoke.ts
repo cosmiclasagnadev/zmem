@@ -1,26 +1,59 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { dirname, join, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { loadAppConfig } from "../src/config/loadConfig.js";
-import { openDatabase, closeDatabase, type DbHandle } from "../src/db/index.js";
+import { resolveStoragePaths } from "../src/storage/paths.js";
+import { openDatabase, closeDatabase, persistMemoryEdge, type DbHandle } from "../src/db/index.js";
 import { runMigrations } from "../src/db/migrate.js";
 import { createEmbeddingProvider } from "../src/embed/factory.js";
 import type { EmbeddingProvider } from "../src/embed/types.js";
 import {
   createCoreContext,
+  createSaveEdgeSuggestionProvider,
   save,
   get,
   list,
+  listNeighbors,
   recall,
   deleteMemory,
   reindex,
   status,
   type CoreContext,
+  type EdgeSuggestionGenerator,
+  type EdgeSuggestionProvider,
 } from "../src/core/index.js";
 import { ingestWorkspace, getIngestStats } from "../src/ingest/index.js";
 import { initializeVectorStore, type VectorCollection, type VectorStore } from "../src/vectors/index.js";
+import {
+  CLI_SEARCH_EXPECTED_GRAPH_TITLE,
+  CLI_SEARCH_EXPECTED_QUERY_TITLE,
+  CLI_SEARCH_EXPECTED_RECENT_TITLE,
+  CLI_SEARCH_GRAPH_QUERY,
+  CLI_SEARCH_PRIMARY_QUERY,
+  CLI_SEARCH_REGRESSION_WORKSPACE,
+  CLI_SEARCH_TYPED_ALLOWED_TYPES,
+  CLI_SEARCH_TYPED_DISALLOWED_TITLES,
+  cliSearchRegressionEdges,
+  cliSearchRegressionMemories,
+  type CliRegressionEdgeFixture,
+  type CliRegressionMemoryFixture,
+} from "../test/fixtures/cli-search-regression.js";
+import {
+  EVALUATION_REGRESSION_WORKSPACE,
+  evaluationRegressionEdges,
+  evaluationRegressionMemories,
+  evaluationRegressionScenarios,
+} from "../test/fixtures/evaluation-regression.js";
+
+const smokeStorageBaseDir = mkdtempSync(join(tmpdir(), "zmem-smoke-storage-"));
+process.env.ZMEM_STORAGE_BASE_DIR = smokeStorageBaseDir;
+process.env.ZMEM_DB_PATH = join(smokeStorageBaseDir, "smoke-memory.db");
+process.env.ZMEM_ZVEC_PATH = join(smokeStorageBaseDir, "smoke-vectors");
+process.env.ZMEM_QUERY_EXPANSION_PROVIDER = "deterministic";
 
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) {
@@ -50,6 +83,24 @@ async function runCase(name: string, fn: () => Promise<void>): Promise<void> {
   }
 }
 
+function parseCliTitles(output: string): string[] {
+  return output
+    .split(/\r?\n/)
+    .flatMap((line) => {
+      const match = line.match(/^\d+\.\s+(.+)$/);
+      return match ? [match[1].trim()] : [];
+    });
+}
+
+function parseCliTypes(output: string): string[] {
+  return output
+    .split(/\r?\n/)
+    .flatMap((line) => {
+      const match = line.match(/Type:\s+([a-z]+)/i);
+      return match ? [match[1].toLowerCase()] : [];
+    });
+}
+
 class Harness {
   private readonly config = loadAppConfig("./config.json", { silent: true });
   private readonly collections = new Map<string, VectorCollection>();
@@ -58,13 +109,14 @@ class Harness {
   private embedProvider: EmbeddingProvider | null = null;
 
   async init(): Promise<void> {
-    mkdirSync(this.config.storage.zvecPath, { recursive: true });
-    mkdirSync(dirname(this.config.storage.dbPath), { recursive: true });
+    const storage = resolveStoragePaths(this.config, "smoke-harness");
+    mkdirSync(storage.zvecPath, { recursive: true });
+    mkdirSync(dirname(storage.dbPath), { recursive: true });
 
-    this.db = openDatabase(this.config.storage.dbPath);
+    this.db = openDatabase(storage.dbPath);
     runMigrations(this.db);
 
-    this.vectorStore = await initializeVectorStore({ zvecPath: this.config.storage.zvecPath });
+    this.vectorStore = await initializeVectorStore({ zvecPath: storage.zvecPath });
 
     this.embedProvider = createEmbeddingProvider({
       provider: this.config.ai.embedding.provider,
@@ -76,7 +128,7 @@ class Harness {
     await this.embedProvider.initialize();
   }
 
-  context(workspace: string): CoreContext {
+  context(workspace: string, edgeSuggestionProvider?: EdgeSuggestionProvider): CoreContext {
     assert(this.db, "DB not initialized");
     assert(this.vectorStore, "Vector store not initialized");
     assert(this.embedProvider, "Embedding provider not initialized");
@@ -93,12 +145,23 @@ class Harness {
       vectorCollection: collection,
       workspace,
       config: this.config,
+      edgeSuggestionProvider,
     });
   }
 
   createCollectionRaw(workspace: string): VectorCollection {
     assert(this.vectorStore, "Vector store not initialized");
     return this.vectorStore.createCollection(workspace, this.config.ai.embedding.dimensions);
+  }
+
+  closeWorkspaceCollection(workspace: string): void {
+    const collection = this.collections.get(workspace);
+    if (!collection) {
+      return;
+    }
+
+    collection.close();
+    this.collections.delete(workspace);
   }
 
   async ingestDocs(workspace: string, workspacePath: string): Promise<void> {
@@ -121,13 +184,123 @@ class Harness {
     });
   }
 
+  resetWorkspace(workspace: string): void {
+    assert(this.db, "DB not initialized");
+
+    const openCollection = this.collections.get(workspace);
+    const memoryRows = this.db.db
+      .prepare(`SELECT id FROM memory_items WHERE workspace = ?`)
+      .all(workspace) as Array<{ id: string }>;
+    const memoryIds = memoryRows.map((row) => row.id);
+    const vectorIds = memoryIds.length === 0
+      ? []
+      : (this.db.db
+          .prepare(`SELECT id FROM content_chunks WHERE memory_id IN (${memoryIds.map(() => "?").join(", ")})`)
+          .all(...memoryIds) as Array<{ id: string }>);
+
+    const collection =
+      openCollection ??
+      this.vectorStore?.openCollection(workspace) ??
+      null;
+
+    if (collection) {
+      for (const row of vectorIds) {
+        collection.delete(row.id);
+      }
+    }
+
+    openCollection?.close();
+    this.collections.delete(workspace);
+    if (collection && collection !== openCollection) {
+      collection.close();
+    }
+
+    this.db.db.prepare(`DELETE FROM memory_items WHERE workspace = ?`).run(workspace);
+  }
+
+  seedWorkspaceFixtures(
+    workspace: string,
+    memories: Array<
+      Omit<CliRegressionMemoryFixture, "chunks"> & {
+        chunks?: string[];
+        status?: "active" | "archived" | "deleted";
+        supersedesId?: string | null;
+      }
+    >,
+    edges: CliRegressionEdgeFixture[] = []
+  ): void {
+    assert(this.db, "DB not initialized");
+
+    const insertMemory = this.db.db.prepare(`
+      INSERT INTO memory_items (
+        id, type, title, content, summary, source, scope, workspace,
+        tags, importance, status, supersedes_id, content_hash, created_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const insertChunk = this.db.db.prepare(`
+      INSERT INTO content_chunks (id, memory_id, seq, pos, token_count, chunk_text, created_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?)
+    `);
+
+    for (const memory of memories) {
+      insertMemory.run(
+        memory.id,
+        memory.type,
+        memory.title,
+        memory.content,
+        memory.summary ?? "",
+        memory.source ?? "fixture",
+        memory.scope ?? "workspace",
+        workspace,
+        JSON.stringify(memory.tags ?? []),
+        memory.importance ?? 0.5,
+        memory.status ?? "active",
+        memory.supersedesId ?? null,
+        createHash("sha256").update(memory.content).digest("hex"),
+        memory.createdAt,
+        memory.updatedAt ?? memory.createdAt
+      );
+
+      let position = 0;
+      (memory.chunks ?? [memory.content]).forEach((chunk, index) => {
+        insertChunk.run(
+          `${memory.id}_${index}`,
+          memory.id,
+          index,
+          position,
+          chunk.split(/\s+/).length,
+          chunk,
+          memory.createdAt
+        );
+        position += chunk.length + 1;
+      });
+    }
+
+    for (const edge of edges) {
+      persistMemoryEdge(this.db, edge);
+    }
+  }
+
   getStats(workspace: string): { total: number; active: number; deleted: number; archived: number; chunks: number } {
     assert(this.db, "DB not initialized");
     return getIngestStats(this.db, workspace);
   }
 
+  countCanonicalEdges(args: { fromMemoryId: string; toMemoryId: string; relationType: string }): number {
+    assert(this.db, "DB not initialized");
+    const row = this.db.db.prepare(`
+      SELECT COUNT(*) AS count
+      FROM memory_edges
+      WHERE from_memory_id = ?
+        AND to_memory_id = ?
+        AND relation_type = ?
+    `).get(args.fromMemoryId, args.toMemoryId, args.relationType) as { count: number };
+
+    return row.count;
+  }
+
   get zvecPath(): string {
-    return this.config.storage.zvecPath;
+    return resolveStoragePaths(this.config, "smoke-harness").zvecPath;
   }
 
   async close(): Promise<void> {
@@ -207,7 +380,9 @@ async function main(): Promise<void> {
   const workspaceB = `smoke-core-b-${runId}`;
   const workspaceEmpty = `smoke-empty-${runId}`;
   const workspaceIngest = `smoke-ingest-${runId}`;
+  const workspaceHistory = `smoke-history-${runId}`;
   const mcpWorkspace = `smoke-mcp-${runId}`;
+  const cliRegressionWorkspace = CLI_SEARCH_REGRESSION_WORKSPACE;
   const harness = new Harness();
   await harness.init();
 
@@ -374,6 +549,289 @@ async function main(): Promise<void> {
       );
       });
 
+      await runCase("recent, important, and typed recall modes", async () => {
+      const ctx = harness.context(workspace);
+      const token = `modememory${runId}`;
+      const olderTitle = `Mode older ${token}`;
+      const importantTitle = `Mode important ${token}`;
+      const preferenceTitle = `Mode preference ${token}`;
+
+      const olderLexical = await save(ctx, {
+        type: "fact",
+        title: olderTitle,
+        content: `Contains ${token} but should not win recent mode`,
+        source: "smoke",
+        scope: "workspace",
+        importance: 0.35,
+      });
+
+      const importantDecision = await save(ctx, {
+        type: "decision",
+        title: importantTitle,
+        content: `Important decision memory ${token}`,
+        source: "smoke",
+        scope: "workspace",
+        importance: 0.94,
+      });
+
+      const typedPreference = await save(ctx, {
+        type: "preference",
+        title: preferenceTitle,
+        content: `Workspace preference memory ${token}`,
+        source: "smoke",
+        scope: "workspace",
+        importance: 0.82,
+      });
+
+      const recentHits = await recall(ctx, token, { mode: "recent", topK: 3 });
+      assert(recentHits[0]?.id === typedPreference.id, "Recent mode should return the newest item first");
+      assert(recentHits.some((hit) => hit.id === olderLexical.id), "Recent mode should still include older items by recency");
+
+      const importantHits = await recall(ctx, "", { mode: "important", topK: 3 });
+      assert(importantHits[0]?.id === importantDecision.id, "Important mode should prefer high-importance items");
+
+      const typedHits = await recall(ctx, "", {
+        mode: "typed",
+        types: ["decision", "preference"],
+        topK: 3,
+      });
+      assert(typedHits.every((hit) => hit.type === "decision" || hit.type === "preference"), "Typed mode should filter to requested types");
+      assert(!typedHits.some((hit) => hit.id === olderLexical.id), "Typed mode should exclude disallowed types");
+
+      harness.closeWorkspaceCollection(workspace);
+      const cliOutput = execFileSync(
+        "node",
+        ["dist/index.js", "query", "", "--mode=recent", `--workspace=${workspace}`],
+        { cwd: process.cwd(), encoding: "utf8" }
+      );
+      assert(cliOutput.includes(`1. ${preferenceTitle}`), "CLI recent mode should print the newest item first");
+      });
+
+      await runCase("CLI search regression fixtures", async () => {
+      harness.resetWorkspace(cliRegressionWorkspace);
+      harness.seedWorkspaceFixtures(cliRegressionWorkspace, cliSearchRegressionMemories, cliSearchRegressionEdges);
+
+      const ctx = harness.context(cliRegressionWorkspace);
+      const reindexResult = await reindex(ctx);
+      assert(reindexResult.errors === 0, "CLI regression fixture reindex should succeed");
+      assert(reindexResult.processed === cliSearchRegressionMemories.length, "CLI regression fixture should reindex every seeded memory");
+
+      harness.closeWorkspaceCollection(cliRegressionWorkspace);
+      const queryOutput = execFileSync(
+        "node",
+        ["dist/index.js", "query", CLI_SEARCH_PRIMARY_QUERY, `--workspace=${cliRegressionWorkspace}`],
+        { cwd: process.cwd(), encoding: "utf8" }
+      );
+      const queryTitles = parseCliTitles(queryOutput);
+      assert(queryTitles[0] === CLI_SEARCH_EXPECTED_QUERY_TITLE, "CLI query fixture should return the expected title first");
+
+      const recentOutput = execFileSync(
+        "node",
+        ["dist/index.js", "query", "", "--mode=recent", `--workspace=${cliRegressionWorkspace}`],
+        { cwd: process.cwd(), encoding: "utf8" }
+      );
+      const recentTitles = parseCliTitles(recentOutput);
+      assert(recentTitles[0] === CLI_SEARCH_EXPECTED_RECENT_TITLE, "CLI recent fixture should return the newest item first");
+
+      const typedOutput = execFileSync(
+        "node",
+        [
+          "dist/index.js",
+          "query",
+          "",
+          "--mode=typed",
+          `--types=${CLI_SEARCH_TYPED_ALLOWED_TYPES.join(",")}`,
+          `--workspace=${cliRegressionWorkspace}`,
+        ],
+        { cwd: process.cwd(), encoding: "utf8" }
+      );
+      const typedTypes = parseCliTypes(typedOutput);
+      assert(typedTypes.length > 0, "CLI typed fixture should emit typed results");
+      assert(
+        typedTypes.every((type) => CLI_SEARCH_TYPED_ALLOWED_TYPES.includes(type as (typeof CLI_SEARCH_TYPED_ALLOWED_TYPES)[number])),
+        "CLI typed fixture should only print allowed types"
+      );
+      for (const disallowedTitle of CLI_SEARCH_TYPED_DISALLOWED_TITLES) {
+        assert(!typedOutput.includes(disallowedTitle), `CLI typed fixture should exclude ${disallowedTitle}`);
+      }
+
+      const graphOutput = execFileSync(
+        "node",
+        ["dist/index.js", "query", CLI_SEARCH_GRAPH_QUERY, `--workspace=${cliRegressionWorkspace}`],
+        { cwd: process.cwd(), encoding: "utf8" }
+      );
+      const graphTitles = parseCliTitles(graphOutput);
+      assert(graphTitles.includes(CLI_SEARCH_EXPECTED_GRAPH_TITLE), "CLI graph-aware fixture should surface linked context");
+      });
+
+      await runCase("default storage stays outside repo", async () => {
+        const repoLikeDir = mkdtempSync(join(tmpdir(), "zmem-repo-like-"));
+        const docsDir = join(repoLikeDir, "docs");
+        const xdgDataHome = mkdtempSync(join(tmpdir(), "zmem-xdg-home-"));
+        mkdirSync(docsDir, { recursive: true });
+        writeFileSync(
+          join(docsDir, "note.md"),
+          [
+            "---",
+            "type: fact",
+            "scope: workspace",
+            "---",
+            "",
+            "# Repo-local data should stay out of this folder",
+            "",
+            "Database migration notes with linked rollback context.",
+          ].join("\n")
+        );
+
+        const env = {
+          ...process.env,
+          XDG_DATA_HOME: xdgDataHome,
+          ZMD_EMBED_PROVIDER: "mock",
+          ZMD_EMBED_DIMENSIONS: "1024",
+          ZMEM_DB_PATH: undefined,
+          ZMEM_ZVEC_PATH: undefined,
+          ZMEM_STORAGE_BASE_DIR: undefined,
+        };
+
+        execFileSync(
+          "node",
+          [join(process.cwd(), "dist/index.js"), "ingest", docsDir, "--workspace=repo-default-check"],
+          { cwd: repoLikeDir, encoding: "utf8", env }
+        );
+
+        assert(!existsSync(join(repoLikeDir, "data")), "Default CLI storage should not create ./data inside the working repo");
+
+        const expectedDbPath = join(xdgDataHome, "zmem", "workspaces", "repo-default-check", "memory.db");
+        const expectedVectorDir = join(xdgDataHome, "zmem", "workspaces", "repo-default-check", "vectors");
+        assert(existsSync(expectedDbPath), "Default CLI storage should create the workspace database under XDG data home");
+        assert(existsSync(expectedVectorDir), "Default CLI storage should create the workspace vector directory under XDG data home");
+      });
+
+      await runCase("config and model CLI helpers", async () => {
+        const cliDir = mkdtempSync(join(tmpdir(), "zmem-cli-helpers-"));
+        const configPath = join(cliDir, "config.json");
+        const rootPath = join(cliDir, "workspace-root");
+        mkdirSync(rootPath, { recursive: true });
+
+        const initOutput = execFileSync("node", ["dist/index.js", "init", `--config=${configPath}`, "--workspace=cli-helper", `--root=${rootPath}`, "--yes"], {
+          cwd: process.cwd(),
+          encoding: "utf8",
+          env: { ...process.env, ZMEM_QUERY_EXPANSION_PROVIDER: "deterministic" },
+        });
+        assert(initOutput.includes("Wrote config"), "init should write a config file");
+        assert(existsSync(configPath), "init should create the requested config file");
+
+        const doctorOutput = execFileSync("node", ["dist/index.js", "doctor", `--config=${configPath}`, "--workspace=cli-helper"], {
+          cwd: process.cwd(),
+          encoding: "utf8",
+        });
+        assert(doctorOutput.includes("Query expansion provider"), "doctor should report query expansion settings");
+
+        const configOutput = execFileSync("node", ["dist/index.js", "config", "show", `--config=${configPath}`, "--workspace=cli-helper"], {
+          cwd: process.cwd(),
+          encoding: "utf8",
+        });
+        const parsedConfigOutput = JSON.parse(configOutput) as { workspace?: string; queryExpansionModels?: { primary?: { modelUri?: string } } };
+        assert(parsedConfigOutput.workspace === "cli-helper", "config show should echo the selected workspace");
+        assert(typeof parsedConfigOutput.queryExpansionModels?.primary?.modelUri === "string", "config show should include resolved query expansion model info");
+
+        const modelsStatusOutput = execFileSync("node", ["dist/index.js", "models", "status", `--config=${configPath}`], {
+          cwd: process.cwd(),
+          encoding: "utf8",
+        });
+        assert(modelsStatusOutput.includes("Query expansion primary"), "models status should print the primary query expansion model");
+
+        const modelsPullOutput = execFileSync("node", ["dist/index.js", "models", "pull", `--config=${configPath}`], {
+          cwd: process.cwd(),
+          encoding: "utf8",
+        });
+        assert(modelsPullOutput.includes("node-llama-cpp pull"), "models pull should print manual pull instructions");
+      });
+
+      await runCase("evaluation regression fixtures", async () => {
+      harness.resetWorkspace(EVALUATION_REGRESSION_WORKSPACE);
+      harness.seedWorkspaceFixtures(EVALUATION_REGRESSION_WORKSPACE, evaluationRegressionMemories, evaluationRegressionEdges);
+
+      const ctx = harness.context(EVALUATION_REGRESSION_WORKSPACE);
+      const reindexResult = await reindex(ctx);
+      assert(reindexResult.errors === 0, "Evaluation regression fixture reindex should succeed");
+      assert(
+        reindexResult.processed === evaluationRegressionMemories.filter((memory) => (memory.status ?? "active") === "active").length,
+        "Evaluation regression fixture should reindex every active seeded memory"
+      );
+
+      harness.closeWorkspaceCollection(EVALUATION_REGRESSION_WORKSPACE);
+      for (const scenario of evaluationRegressionScenarios) {
+        if (scenario.smokePath === "cli") {
+          const args = [
+            "dist/index.js",
+            "query",
+            scenario.query,
+            `--mode=${scenario.mode}`,
+            `--workspace=${EVALUATION_REGRESSION_WORKSPACE}`,
+          ];
+          if (scenario.types && scenario.types.length > 0) {
+            args.push(`--types=${scenario.types.join(",")}`);
+          }
+          const output = execFileSync("node", args, { cwd: process.cwd(), encoding: "utf8" });
+          const titles = parseCliTitles(output);
+          const expectedTitles = scenario.expectedIds
+            .map((id) => evaluationRegressionMemories.find((memory) => memory.id === id)?.title)
+            .filter((title): title is string => typeof title === "string");
+
+          assert(
+            titles.slice(0, expectedTitles.length).join("\n") === expectedTitles.join("\n"),
+            `Evaluation CLI fixture ${scenario.id} should keep the expected ranking`
+          );
+          for (const excludedId of scenario.excludedIds ?? []) {
+            const excludedTitle = evaluationRegressionMemories.find((memory) => memory.id === excludedId)?.title;
+            if (excludedTitle) {
+              assert(!titles.includes(excludedTitle), `Evaluation CLI fixture ${scenario.id} should exclude ${excludedTitle}`);
+            }
+          }
+          continue;
+        }
+
+        const hits = await recall(ctx, scenario.query, {
+          mode: scenario.mode,
+          topK: scenario.topK,
+          includeSuperseded: scenario.includeSuperseded,
+          types: scenario.types,
+        });
+        for (const expectedId of scenario.expectedIds) {
+          assert(hits.some((hit) => hit.id === expectedId), `Evaluation core fixture ${scenario.id} should include ${expectedId}`);
+        }
+        for (const excludedId of scenario.excludedIds ?? []) {
+          assert(!hits.some((hit) => hit.id === excludedId), `Evaluation core fixture ${scenario.id} should exclude ${excludedId}`);
+        }
+      }
+      });
+
+      await runCase("chunk-first recall snippet selection", async () => {
+      const ctx = harness.context(workspace);
+      const anchor = `story5chunkanchor${runId}`;
+      const early = "Early section context. ".repeat(260);
+      const evidence = (`Matched chunk evidence ${anchor} selects this snippet. `).repeat(40);
+      const late = "Late section wrap-up. ".repeat(260);
+
+      const saved = await save(ctx, {
+        type: "fact",
+        title: `Chunk-first ${runId}`,
+        content: `${early}\n\n${evidence}\n\n${late}`,
+        source: "smoke",
+        scope: "workspace",
+        tags: ["chunk-first"],
+      });
+
+      const hits = await recall(ctx, anchor, { mode: "lexical", topK: 10 });
+      const ownHits = hits.filter((hit) => hit.id === saved.id);
+      assert(ownHits.length === 1, "Chunk-first recall should return one memory result per item");
+      assert(
+        ownHits[0]?.snippet.includes(anchor) && ownHits[0]?.snippet.includes("selects this snippet"),
+        "Chunk-first recall should surface evidence from the matched chunk"
+      );
+      });
+
       await runCase("reindex behavior", async () => {
       const ctx = harness.context(workspace);
       const ctxEmpty = harness.context(workspaceEmpty);
@@ -426,6 +884,390 @@ async function main(): Promise<void> {
       });
       const longHits = await recall(ctx, longToken, { mode: "hybrid" });
       assert(longHits.some((h) => h.id === longSaved.id), "Long content should remain recallable");
+      });
+
+      await runCase("graph edge persistence", async () => {
+      const ctx = harness.context(workspace);
+      const token = `smokegraph${runId}`;
+
+      const from = await save(ctx, {
+        type: "fact",
+        title: `Graph source ${token}`,
+        content: `Graph source content ${token}`,
+        source: "smoke",
+        scope: "workspace",
+        tags: ["graph"],
+      });
+
+      const to = await save(ctx, {
+        type: "fact",
+        title: `Graph target ${token}`,
+        content: `Graph target content ${token}`,
+        source: "smoke",
+        scope: "workspace",
+        tags: ["graph"],
+      });
+
+      persistMemoryEdge(ctx.db, {
+        id: `edge-${token}-1`,
+        fromMemoryId: from.id,
+        toMemoryId: to.id,
+        relationType: "related_to",
+        confidence: 0.88,
+        origin: "manual",
+        status: "accepted",
+        justification: "Smoke canonical edge",
+        acceptedBy: "user",
+      });
+
+      persistMemoryEdge(ctx.db, {
+        id: `edge-${token}-2`,
+        fromMemoryId: from.id,
+        toMemoryId: to.id,
+        relationType: "related_to",
+        confidence: 0.91,
+        origin: "manual",
+        status: "accepted",
+        justification: "Duplicate smoke canonical edge",
+        acceptedBy: "user",
+      });
+
+      assert(
+        harness.countCanonicalEdges({
+          fromMemoryId: from.id,
+          toMemoryId: to.id,
+          relationType: "related_to",
+        }) === 1,
+        "Expected exactly one canonical graph edge row"
+      );
+      });
+
+      await runCase("save with explicit links and neighbor retrieval", async () => {
+      const ctx = harness.context(workspace);
+      const token = `smokelinksave${runId}`;
+
+      const target = await save(ctx, {
+        type: "fact",
+        title: `Link target ${token}`,
+        content: `Link target content ${token}`,
+        source: "smoke",
+        scope: "workspace",
+        tags: ["graph"],
+      });
+
+      const linked = await save(ctx, {
+        type: "decision",
+        title: `Link source ${token}`,
+        content: `Link source content ${token}`,
+        source: "smoke",
+        scope: "workspace",
+        tags: ["graph"],
+        links: [
+          {
+            toMemoryId: target.id,
+            relationType: "supports",
+            confidence: 0.93,
+            justification: "Smoke explicit link",
+          },
+        ],
+      });
+
+      assert(
+        harness.countCanonicalEdges({
+          fromMemoryId: linked.id,
+          toMemoryId: target.id,
+          relationType: "supports",
+        }) === 1,
+        "Expected explicit link save to persist one canonical edge"
+      );
+
+      const neighbors = await listNeighbors(ctx, linked.id, {
+        direction: "outbound",
+        statuses: ["accepted"],
+      });
+      assert(neighbors.some((neighbor) => neighbor.memory.id === target.id), "Expected saved explicit link to be retrievable as a neighbor");
+      });
+
+      await runCase("save with deterministic suggested edges", async () => {
+      const seedCtx = harness.context(workspace);
+      const token = `smokesuggest${runId}`;
+
+      await Promise.all(
+        Array.from({ length: 4 }, async (_, index) =>
+          save(seedCtx, {
+            type: "fact",
+            title: `Suggestion target ${token} ${index}`,
+            content: `Suggestion target content ${token} ${index}`,
+            source: "smoke",
+            scope: "workspace",
+            tags: ["graph", "suggested"],
+            suggestEdges: false,
+          })
+        )
+      );
+
+      const generator: EdgeSuggestionGenerator = {
+        async suggest({ candidatePool }) {
+          return candidatePool.allCandidates.map((candidate, index) => ({
+            toMemoryId: candidate.memoryId,
+            relationType: "related_to",
+            confidence: 0.95 - index * 0.1,
+            evidenceScore: 10 - index,
+            justification: `Smoke deterministic suggestion ${candidate.memoryId}`,
+          }));
+        },
+      };
+      const ctx = harness.context(
+        workspace,
+        createSaveEdgeSuggestionProvider({
+          generator,
+          topK: 3,
+          recentCandidateLimit: 4,
+          semanticCandidateLimit: 4,
+        })
+      );
+
+      const saved = await save(ctx, {
+        type: "decision",
+        title: `Suggestion source ${token}`,
+        content: `Suggestion source content ${token}`,
+        source: "smoke",
+        scope: "workspace",
+        tags: ["graph", "suggested"],
+      });
+
+      const neighbors = await listNeighbors(ctx, saved.id, {
+        direction: "outbound",
+        origins: ["llm"],
+        statuses: ["suggested"],
+      });
+      assert(neighbors.length === 3, "Expected only the top suggested edges to persist");
+      assert(
+        neighbors.every((neighbor) => neighbor.edge.origin === "llm" && neighbor.edge.status === "suggested"),
+        "Expected suggested edges to persist as llm/suggested"
+      );
+      });
+
+      await runCase("graph-aware relational recall", async () => {
+      const ctx = harness.context(workspace);
+      const token = `smokegraphintent${runId}`;
+
+      const changedSeed = await save(ctx, {
+        type: "event",
+        title: `What changed ${token}`,
+        content: `What changed after the rollout ${token}`,
+        source: "smoke",
+        scope: "workspace",
+        tags: ["graph", "history"],
+        suggestEdges: false,
+      });
+      const changedNeighbor = await save(ctx, {
+        type: "fact",
+        title: `Previous baseline ${token}`,
+        content: `Baseline notes before the rollout ${token}`,
+        source: "smoke",
+        scope: "workspace",
+        tags: ["graph", "history"],
+        suggestEdges: false,
+      });
+
+      const whySeed = await save(ctx, {
+        type: "decision",
+        title: `Why we chose this ${token}`,
+        content: `Why did we choose this architecture ${token}`,
+        source: "smoke",
+        scope: "workspace",
+        tags: ["graph", "decision"],
+        suggestEdges: false,
+      });
+      const whyNeighbor = await save(ctx, {
+        type: "fact",
+        title: `Decision rationale ${token}`,
+        content: `Tradeoff analysis and rationale ${token}`,
+        source: "smoke",
+        scope: "workspace",
+        tags: ["graph", "decision"],
+        suggestEdges: false,
+      });
+
+      const relatedSeed = await save(ctx, {
+        type: "fact",
+        title: `Related context ${token}`,
+        content: `Related context for the project ${token}`,
+        source: "smoke",
+        scope: "workspace",
+        tags: ["graph", "context"],
+        suggestEdges: false,
+      });
+      const relatedAccepted = await save(ctx, {
+        type: "fact",
+        title: `Accepted related note ${token}`,
+        content: `Accepted linked context ${token}`,
+        source: "smoke",
+        scope: "workspace",
+        tags: ["graph", "context"],
+        suggestEdges: false,
+      });
+      const relatedSuggested = await save(ctx, {
+        type: "fact",
+        title: `Suggested related note ${token}`,
+        content: `Suggested linked context ${token}`,
+        source: "smoke",
+        scope: "workspace",
+        tags: ["graph", "context"],
+        suggestEdges: false,
+      });
+
+      persistMemoryEdge(ctx.db, {
+        id: `edge-${token}-changed`,
+        fromMemoryId: changedSeed.id,
+        toMemoryId: changedNeighbor.id,
+        relationType: "derived_from",
+        confidence: 0.94,
+        origin: "manual",
+        status: "accepted",
+        justification: "Smoke history link",
+        acceptedBy: "user",
+      });
+      persistMemoryEdge(ctx.db, {
+        id: `edge-${token}-why`,
+        fromMemoryId: whySeed.id,
+        toMemoryId: whyNeighbor.id,
+        relationType: "supports",
+        confidence: 0.93,
+        origin: "manual",
+        status: "accepted",
+        justification: "Smoke decision link",
+        acceptedBy: "user",
+      });
+      persistMemoryEdge(ctx.db, {
+        id: `edge-${token}-related-accepted`,
+        fromMemoryId: relatedSeed.id,
+        toMemoryId: relatedAccepted.id,
+        relationType: "related_to",
+        confidence: 0.92,
+        origin: "manual",
+        status: "accepted",
+        justification: "Smoke accepted related link",
+        acceptedBy: "user",
+      });
+      persistMemoryEdge(ctx.db, {
+        id: `edge-${token}-related-suggested`,
+        fromMemoryId: relatedSeed.id,
+        toMemoryId: relatedSuggested.id,
+        relationType: "related_to",
+        confidence: 0.98,
+        origin: "llm",
+        status: "suggested",
+        justification: "Smoke suggested related link",
+        acceptedBy: null,
+      });
+
+      const changedHits = await recall(ctx, "what changed", { mode: "lexical", topK: 5 });
+      assert(changedHits.some((hit) => hit.id === changedSeed.id), "Expected what changed seed hit");
+      assert(changedHits.some((hit) => hit.id === changedNeighbor.id), "Expected accepted history neighbor injection");
+      const changedNeighborHit = changedHits.find((hit) => hit.id === changedNeighbor.id);
+      assert(changedNeighborHit?.explanation?.includes("accepted manual link"), "Expected graph-heavy explanation to mention accepted manual link");
+
+      const whyHits = await recall(ctx, "why did we choose this", { mode: "lexical", topK: 5 });
+      assert(whyHits.some((hit) => hit.id === whySeed.id), "Expected why seed hit");
+      assert(whyHits.some((hit) => hit.id === whyNeighbor.id), "Expected accepted rationale neighbor injection");
+
+      const relatedHits = await recall(ctx, "related context", { mode: "lexical", topK: 5 });
+      assert(relatedHits.some((hit) => hit.id === relatedSeed.id), "Expected related seed hit");
+      assert(relatedHits.some((hit) => hit.id === relatedAccepted.id), "Expected accepted related neighbor injection");
+      assert(
+        !relatedHits.some((hit) => hit.id === relatedSuggested.id),
+        "Suggested-only related neighbor should not be injected in v1"
+      );
+      });
+
+      await runCase("history-aware lineage reranking", async () => {
+      const ctx = harness.context(workspaceHistory);
+      const token = `smokelineage${runId}`;
+
+      const baseline = await save(ctx, {
+        type: "event",
+        title: `Baseline ${token}`,
+        content: `Previous baseline before the rollout ${token}`,
+        source: "smoke",
+        scope: "workspace",
+        tags: ["history", "lineage"],
+        suggestEdges: false,
+      });
+
+      await save(ctx, {
+        type: "event",
+        title: `Current summary ${token}`,
+        content: `What changed after the rollout ${token}`,
+        source: "smoke",
+        scope: "workspace",
+        tags: ["history", "lineage"],
+        supersedesId: baseline.id,
+        suggestEdges: false,
+      });
+
+      await save(ctx, {
+        type: "fact",
+        title: `Unrelated note ${token}`,
+        content: `Another rollout note with mild overlap ${token}`,
+        source: "smoke",
+        scope: "workspace",
+        tags: ["history"],
+        suggestEdges: false,
+      });
+
+      const historyHits = await recall(ctx, "what changed before the rollout", {
+        mode: "lexical",
+        topK: 5,
+        includeSuperseded: true,
+      });
+      const baselineHit = historyHits.find((hit) => hit.id === baseline.id);
+      assert(baselineHit, "Expected superseded baseline to surface for history-heavy query");
+      assert(baselineHit.explanation?.includes("same history chain"), "Expected history-heavy explanation to mention lineage");
+      });
+
+      await runCase("deterministic query expansion remains bounded and traceable", async () => {
+      const ctx = harness.context(workspace);
+      const token = `smokeexpansion${runId}`;
+
+      const expansionOnly = await save(ctx, {
+        type: "fact",
+        title: `Decision rationale ${token}`,
+        content: `Decision rationale tradeoff analysis why choose selected approach ${token}`,
+        source: "smoke",
+        scope: "workspace",
+        tags: ["expansion"],
+        suggestEdges: false,
+      });
+
+      const { expandQuery } = await import("../src/search/query-expansion.ts");
+      const deterministicPlan = await expandQuery("why did we choose this", "deterministic");
+      assert(deterministicPlan.variants.length <= 4, "Deterministic expansion should stay bounded");
+      assert(
+        deterministicPlan.variants.some((variant) => variant.strategy === "semantic" && variant.label === "semantic:decision-rationale"),
+        "Deterministic expansion should expose semantic strategy labels"
+      );
+
+      const disabledPlan = await expandQuery("why did we choose this", "off");
+      assert(
+        disabledPlan.variants.length === 1 && disabledPlan.variants[0]?.label === "original:raw",
+        "Disabled expansion should keep only the original variant"
+      );
+
+      const disabledHits = await recall(ctx, "decision rationale", {
+        mode: "lexical",
+        topK: 5,
+        expansionMode: "off",
+      });
+      assert(disabledHits.some((hit) => hit.id === expansionOnly.id), "Disabled expansion should preserve exact-match recall behavior");
+
+      const expandedHits = await recall(ctx, "decision rationale", {
+        mode: "hybrid",
+        topK: 5,
+        expansionMode: "deterministic",
+      });
+      assert(expandedHits.some((hit) => hit.id === expansionOnly.id), "Deterministic expansion should preserve exact-match retrieval when enabled");
       });
 
       await runCase("special-char content and concurrent saves", async () => {
@@ -557,6 +1399,10 @@ async function main(): Promise<void> {
         const tools = await session.client.listTools();
         const names = tools.tools.map((t) => t.name).sort();
         assert(names.includes("memory_query"), "memory_query should be registered");
+        assert(names.includes("memory_search"), "memory_search should be registered");
+        assert(names.includes("memory_link"), "memory_link should be registered");
+        assert(names.includes("memory_neighbors"), "memory_neighbors should be registered");
+        assert(names.includes("memory_edge_update"), "memory_edge_update should be registered");
         assert(!names.includes("memory_reindex"), "memory_reindex should be disabled by default");
 
         const emptyResult = await session.client.callTool({
@@ -586,6 +1432,51 @@ async function main(): Promise<void> {
         const getResult = await session.client.callTool({ name: "memory_get", arguments: { id: savedId } });
         assert(!getResult.isError, "memory_get should succeed");
 
+        const linkA = await session.client.callTool({
+          name: "memory_save",
+          arguments: {
+            type: "decision",
+            title: `MCP Link A ${runId}`,
+            content: `Relational root ${secretQuery}`,
+            source: "smoke",
+            scope: "workspace",
+            tags: ["mcp", "graph"],
+          },
+        });
+        assert(!linkA.isError, "memory_save should create link A");
+        const linkAId = (linkA.structuredContent as { id?: string } | undefined)?.id;
+        assert(typeof linkAId === "string", "link A should have id");
+
+        const linkB = await session.client.callTool({
+          name: "memory_save",
+          arguments: {
+            type: "fact",
+            title: `MCP Link B ${runId}`,
+            content: `Neighbor evidence ${secretQuery}`,
+            source: "smoke",
+            scope: "workspace",
+            tags: ["mcp", "graph"],
+          },
+        });
+        assert(!linkB.isError, "memory_save should create link B");
+        const linkBId = (linkB.structuredContent as { id?: string } | undefined)?.id;
+        assert(typeof linkBId === "string", "link B should have id");
+
+        const linkC = await session.client.callTool({
+          name: "memory_save",
+          arguments: {
+            type: "event",
+            title: `MCP Link C ${runId}`,
+            content: `Second hop evidence ${secretQuery}`,
+            source: "smoke",
+            scope: "workspace",
+            tags: ["mcp", "graph"],
+          },
+        });
+        assert(!linkC.isError, "memory_save should create link C");
+        const linkCId = (linkC.structuredContent as { id?: string } | undefined)?.id;
+        assert(typeof linkCId === "string", "link C should have id");
+
         const listResult = await session.client.callTool({
           name: "memory_list",
           arguments: { limit: 10, offset: 0, status: "active" },
@@ -597,6 +1488,143 @@ async function main(): Promise<void> {
           arguments: { query: secretQuery, mode: "hybrid", limit: 5 },
         });
         assert(!queryResult.isError, "memory_query should succeed");
+
+        const searchDefault = await session.client.callTool({
+          name: "memory_search",
+          arguments: { query: secretQuery, mode: "hybrid", limit: 5 },
+        });
+        assert(!searchDefault.isError, "memory_search should succeed");
+        const searchDefaultPayload = searchDefault.structuredContent as {
+          items?: Array<{ id: string; snippet: string; score: number }>;
+          count?: number;
+        };
+        assert(Array.isArray(searchDefaultPayload.items), "memory_search should return items array");
+        assert(typeof searchDefaultPayload.count === "number", "memory_search should return count");
+        assert(
+          Object.keys(searchDefaultPayload).sort().join(",") === "count,items",
+          "memory_search should return clean default fields only"
+        );
+        assert(
+          searchDefaultPayload.items?.some((item) => item.id === savedId),
+          "memory_search should include saved memory item"
+        );
+        assert(
+          searchDefaultPayload.items?.every((item) => typeof item.snippet === "string" && item.snippet.length > 0 && typeof item.score === "number"),
+          "memory_search default items should include score and snippet evidence"
+        );
+
+        const searchRich = await session.client.callTool({
+          name: "memory_search",
+          arguments: {
+            query: secretQuery,
+            mode: "hybrid",
+            limit: 5,
+            includes: { matches: true, edges: true, explanations: true, debug: true },
+          },
+        });
+        assert(!searchRich.isError, "memory_search rich output should succeed");
+        const searchRichPayload = searchRich.structuredContent as {
+          matches?: Array<{ memoryId: string; snippet: string }>;
+          edges?: Array<{ memoryId: string; neighbor: { id: string } }>;
+          explanations?: Array<{ memoryId: string; text: string }>;
+          debug?: { matchCount?: number; resultIds?: string[] };
+        };
+        assert(Array.isArray(searchRichPayload.matches), "memory_search should expose matches when requested");
+        assert(Array.isArray(searchRichPayload.edges), "memory_search should expose edges when requested");
+        assert(Array.isArray(searchRichPayload.explanations), "memory_search should expose explanations when requested");
+        assert(typeof searchRichPayload.debug === "object", "memory_search should expose debug when requested");
+        assert(
+          searchRichPayload.matches?.some((match) => match.memoryId === savedId && match.snippet.length > 0),
+          "memory_search matches should include snippets"
+        );
+
+        const manualLink = await session.client.callTool({
+          name: "memory_link",
+          arguments: {
+            fromMemoryId: linkAId,
+            toMemoryId: linkBId,
+            relationType: "related_to",
+            confidence: 0.91,
+            justification: "smoke accepted link",
+          },
+        });
+        assert(!manualLink.isError, "memory_link should succeed");
+        const manualLinkPayload = manualLink.structuredContent as {
+          edge?: { id: string; status: string; acceptedBy: string | null; fromMemoryId: string; toMemoryId: string };
+        };
+        assert(manualLinkPayload.edge?.status === "accepted", "memory_link should create accepted edges");
+        assert(manualLinkPayload.edge?.acceptedBy === "agent", "memory_link should default acceptedBy=agent");
+        assert(
+          [manualLinkPayload.edge?.fromMemoryId, manualLinkPayload.edge?.toMemoryId].sort().join(":") === [linkAId, linkBId].sort().join(":"),
+          "memory_link should connect the requested pair"
+        );
+
+        const suggestedLink = await session.client.callTool({
+          name: "memory_link",
+          arguments: {
+            fromMemoryId: linkBId,
+            toMemoryId: linkCId,
+            relationType: "supports",
+            confidence: 0.62,
+            status: "suggested",
+            justification: "smoke suggested link",
+          },
+        });
+        assert(!suggestedLink.isError, "memory_link should allow suggested edges");
+        const suggestedEdgeId = (suggestedLink.structuredContent as { edge?: { id?: string; status?: string } } | undefined)?.edge?.id;
+        const suggestedEdgeStatus = (suggestedLink.structuredContent as { edge?: { status?: string } } | undefined)?.edge?.status;
+        assert(typeof suggestedEdgeId === "string", "suggested edge should have id");
+        assert(suggestedEdgeStatus === "suggested", "suggested edge should remain suggested initially");
+
+        const promoteLink = await session.client.callTool({
+          name: "memory_edge_update",
+          arguments: {
+            id: suggestedEdgeId,
+            status: "accepted",
+            acceptedBy: "agent",
+            justification: "smoke promotion",
+          },
+        });
+        assert(!promoteLink.isError, "memory_edge_update should succeed");
+        const promotePayload = promoteLink.structuredContent as {
+          edge?: { status?: string; acceptedBy?: string | null };
+        };
+        assert(promotePayload.edge?.status === "accepted", "memory_edge_update should promote suggested edges");
+        assert(promotePayload.edge?.acceptedBy === "agent", "memory_edge_update should preserve acceptance provenance");
+
+        const defaultNeighbors = await session.client.callTool({
+          name: "memory_neighbors",
+          arguments: { id: linkAId },
+        });
+        assert(!defaultNeighbors.isError, "memory_neighbors default query should succeed");
+        const defaultNeighborsPayload = defaultNeighbors.structuredContent as {
+          depth?: number;
+          neighbors?: Array<{ memory: { id: string }; depth: number }>;
+        };
+        assert(defaultNeighborsPayload.depth === 1, "memory_neighbors should default depth to 1");
+        assert(
+          defaultNeighborsPayload.neighbors?.some((neighbor) => neighbor.memory.id === linkBId && neighbor.depth === 1),
+          "memory_neighbors default depth should include first-hop neighbor"
+        );
+        assert(
+          !defaultNeighborsPayload.neighbors?.some((neighbor) => neighbor.depth > 1),
+          "memory_neighbors default depth should exclude deeper-than-first-hop neighbors"
+        );
+
+        const deepNeighbors = await session.client.callTool({
+          name: "memory_neighbors",
+          arguments: { id: linkAId, depth: 2 },
+        });
+        assert(!deepNeighbors.isError, "memory_neighbors depth=2 query should succeed");
+        const deepNeighborsPayload = deepNeighbors.structuredContent as {
+          depth?: number;
+          neighbors?: Array<{ memory: { id: string }; depth: number }>;
+        };
+        assert(deepNeighborsPayload.depth === 2, "memory_neighbors should echo explicit depth");
+        assert(
+          deepNeighborsPayload.neighbors?.some((neighbor) => neighbor.memory.id === linkCId && neighbor.depth === 2),
+          "memory_neighbors depth=2 should include second-hop neighbor"
+        );
 
         const badGet = await session.client.callTool({ name: "memory_get", arguments: { id: "" } });
         assert(badGet.isError, "memory_get should reject invalid id");
