@@ -37,3 +37,19 @@ export function buildEquivalentEdgePairs(
     { fromMemoryId: toMemoryId, toMemoryId: fromMemoryId },
   ];
 }
+
+export function findEquivalentEdgeMatch<T>(
+  fromMemoryId: string,
+  toMemoryId: string,
+  relationType: EdgeRelationType,
+  lookup: (pair: { fromMemoryId: string; toMemoryId: string }) => T | null
+): T | null {
+  for (const pair of buildEquivalentEdgePairs(fromMemoryId, toMemoryId, relationType)) {
+    const match = lookup(pair);
+    if (match) {
+      return match;
+    }
+  }
+
+  return null;
+}

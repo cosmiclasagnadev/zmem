@@ -8,7 +8,7 @@ import type {
   EdgeStatus,
   SaveMemoryData,
 } from "./types.js";
-import { buildEdgeEquivalenceKey, buildEquivalentEdgePairs } from "./edge-rules.js";
+import { buildEdgeEquivalenceKey, findEquivalentEdgeMatch } from "./edge-rules.js";
 import { mapRowToMemoryItem, type MemoryItemRow } from "./utils.js";
 import { searchVector } from "../search/vector.js";
 
@@ -408,21 +408,15 @@ function getExistingCanonicalEdge(
   toMemoryId: string,
   relationType: EdgeRelationType
 ): EdgeRow | null {
-  for (const pair of buildEquivalentEdgePairs(fromMemoryId, toMemoryId, relationType)) {
-    const row = ctx.db.db.prepare(`
+  return findEquivalentEdgeMatch(fromMemoryId, toMemoryId, relationType, (pair) =>
+    (ctx.db.db.prepare(`
       SELECT id, status, confidence
       FROM memory_edges
       WHERE from_memory_id = ?
         AND to_memory_id = ?
         AND relation_type = ?
-    `).get(pair.fromMemoryId, pair.toMemoryId, relationType) as EdgeRow | undefined;
-
-    if (row) {
-      return row;
-    }
-  }
-
-  return null;
+    `).get(pair.fromMemoryId, pair.toMemoryId, relationType) as EdgeRow | undefined) ?? null
+  );
 }
 
 function toSuggestionKey(edge: CreateEdgeInput): string {

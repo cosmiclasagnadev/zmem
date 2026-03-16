@@ -112,7 +112,7 @@ References:
 - explicit memory types and lifecycle (pending, active, archived, deleted) plus supersedes_id
   - if no explicit type is defined, it defaults to 'fact'
   - if no explicit tags are defined, it defaults to '[]' 
-- bounded query expansion is available through deterministic variants today, with room for LLM-backed expansion later
+- local-first query expansion is enabled by default for hybrid retrieval, with deterministic fallback when the local model is unavailable
 - uses `@zvec/zvec` for dense retrieval when doing vector search
 
 ## Architecture (high level)
