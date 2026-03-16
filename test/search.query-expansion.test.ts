@@ -187,3 +187,63 @@ test("configured default expansion mode is honored when recall input omits expan
     cleanup();
   }
 });
+
+test("disabled query expansion forces off mode even when defaults prefer llm", async () => {
+  const customExpander: QueryExpander = {
+    async expand(request) {
+      return {
+        mode: request.mode,
+        originalQuery: request.query,
+        variants: [
+          {
+            query: request.query,
+            strategy: "original",
+            label: "original:raw",
+            weight: 1,
+            target: "both",
+          },
+          {
+            query: "decision rationale",
+            strategy: "lexical",
+            label: `lexical:${request.mode}`,
+            weight: 0.95,
+            target: "lex",
+          },
+        ],
+      };
+    },
+  };
+
+  const { ctx, handle, cleanup } = createTestCoreContext({
+    defaults: {
+      retrieval: {
+        expansionMode: "llm",
+      },
+    },
+    ai: {
+      embedding: {},
+      rerank: {},
+      queryExpansion: {
+        enabled: false,
+      },
+    },
+  }, customExpander);
+
+  try {
+    seedMemory(handle, {
+      id: "mem_disabled_expansion",
+      title: "Decision rationale",
+      content: "Decision rationale and tradeoff analysis for the selected approach.",
+      chunk: "decision rationale tradeoff analysis selected approach",
+    });
+
+    const hits = await recall(ctx, "no direct lexical overlap", {
+      mode: "lexical",
+      topK: 5,
+    });
+
+    assert.deepEqual(hits.map((hit) => hit.id), []);
+  } finally {
+    cleanup();
+  }
+});
